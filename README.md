@@ -69,10 +69,12 @@ pip install -e '.[extra]'
 ### Download Pose Prediction Pretrained Model
 
 You can download the pretrained model weights from [here](https://drive.google.com/drive/folders/1XjHh6VopGX48Hg7vHW3foEvrvMvUMH7C?usp=sharing)
-
+**Pretrained model on CrossDocked2020:**
 ```bash
 gdown --id 1xGC193o4DtSPzWFjmRIlPjmn7bLfMaCd -O ./weights/cgflow_crossdock.ckpt
 ```
+**Pretrained model on Plinder:**
+TBA
 
 ### Construct Generative environment
 
