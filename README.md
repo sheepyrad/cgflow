@@ -128,7 +128,7 @@ This project is licensed under the [MIT License](./LICENSE).
 
 ## Citation
 
-If you use this work, please cite:
+If you use this work, please considering citing these works:
 
 ### CGFlow (ICML '25)
 
