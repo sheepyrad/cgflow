@@ -76,21 +76,22 @@ gdown --id 1xGC193o4DtSPzWFjmRIlPjmn7bLfMaCd -O ./weights/cgflow_crossdock.ckpt
 
 See [Data Preparation](data/README.md) for detailed instructions on preparing datasets and environments.
 
-## Generation
+## Generating molecular candidates for protein targets
 
 ### 1. Pocket-specific Optimization
+You can modify the config file to use your own protein target PDB file. By default, we train CGFlow with QED and docking score as the reward with an oracle budget of 64,000 molecules. 
 
-#### A. GPU-accelerated UniDock
-You can modify the config file to use your own protein target.
+#### A. GPU-accelerated UniDock (Recommended)
 ```bash
 python scripts/opt/opt_unidock.py --config ./configs/opt/aldh1_unidock.yaml
 ```
+In this setting, we perform Full docking, which performs a full search for the optimal binding pose, with UniDock as the reward.
 
 #### B. AutoDock Vina (local-opt)
-
 ```bash
 python scripts/opt/opt_vina.py --config ./configs/opt/aldh1_vina.yaml
 ```
+In this setting, we directly using the final predicted pose from pose prediction model and use "local-opt" setting from AutoDock Vina to compute the reward.
 
 ### 2. Zero-shot Pocket-conditional Generation
 
@@ -100,7 +101,7 @@ TBA
 
 TBA
 
-## Pretraining Pocket-conditional Generative Model
+## Pretraining Pocket-conditional Generative Model (Research)
 
 If you want to train the pocket-conditional generative model, you can use the following procedure.
 
@@ -110,7 +111,7 @@ If you want to train the pocket-conditional generative model, you can use the fo
   python scripts/multi_pocket/tacogfn_proxy.py --name <PREFIX>
   ```
 
-## Pretraining Pose Prediction Model
+## Pretraining Pose Prediction Model (Research) 
 
 If you want to train the pose prediction model, you can use the following procedure.
 
