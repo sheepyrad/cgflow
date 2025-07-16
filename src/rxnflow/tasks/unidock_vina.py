@@ -8,11 +8,12 @@ from rdkit.Chem import QED, Crippen, rdMolDescriptors
 from rdkit.Chem import Mol as RDMol
 from torch import Tensor
 
-from cgflow.utils.extract_pocket import get_mol_center
-from cgflow.utils.unidock import docking
 from rxnflow.base import BaseTask, RxnFlowTrainer
 from rxnflow.config import Config, init_empty
 from rxnflow.utils.chem_metrics import mol2qed, mol2sascore
+
+from synthflow.utils.extract_pocket import get_mol_center
+from synthflow.utils.unidock import docking
 
 aux_tasks = {"qed": mol2qed, "sa": mol2sascore}
 
@@ -180,7 +181,7 @@ if __name__ == "__main__":
     config = init_empty(Config())
     config.print_every = 1
     config.log_dir = "./logs/debug-unidock/"
-    config.env_dir = "./data/envs/catalog"
+    config.env_dir = "./data/envs/stock"
     config.task.constraint.rule = "veber"
     config.overwrite_existing_exp = True
 

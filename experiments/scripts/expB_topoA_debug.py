@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="Gnina-QED optimization using 3D information")
     parser.add_argument("--prefix", type=str, default="topo2", help="Run prefix")
     parser.add_argument("--storage", type=str, default="logs/ex3_topo2/", help="Storage directory")
-    parser.add_argument("--env_dir", type=str, default="data/envs/catalog", help="Environment directory")
+    parser.add_argument("--env_dir", type=str, default="data/envs/stock", help="Environment directory")
     parser.add_argument("--pocket_dir", type=str, default="../topo2/", help="Pocket directory")
     parser.add_argument("--ckpt_path", type=str, default="weights/topo2_epoch209.ckpt", help="Checkpoint path")
     parser.add_argument(

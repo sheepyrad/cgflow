@@ -1,4 +1,3 @@
-import contextlib
 import os
 import subprocess
 import tempfile
@@ -11,6 +10,8 @@ from meeko import MoleculePreparation, PDBQTMolecule, PDBQTWriterLegacy, RDKitMo
 from openbabel import pybel
 from rdkit.Chem import rdDistGeom, rdForceFieldHelpers
 from vina import Vina
+
+from .misc import suppress_stdout
 
 
 def get_mol_coords(mol_path: str | Path) -> np.ndarray:
@@ -42,11 +43,10 @@ def create_vina_from_protein(
     seed: int = 1,
     verbose: bool = False,
 ) -> Vina:
-
     protein_path = Path(protein_path)
     if protein_path.suffix == ".pdbqt":
         protein_pdbqt_path = protein_path
-    elif protein_path.suffix == "pdb":
+    elif protein_path.suffix == ".pdb":
         protein_pdb_path = protein_path
         protein_pdbqt_path = protein_pdb_path.parent / f"{protein_pdb_path.stem}_autodock.pdbqt"
         if not protein_pdbqt_path.exists():
@@ -66,15 +66,6 @@ def create_vina_from_protein(
         center = round(x, 3), round(y, 3), round(z, 3)
     v.compute_vina_maps(center, size)
     return v
-
-
-def suppress_stdout(func):
-    def wrapper(*a, **ka):
-        with open(os.devnull, "w") as devnull:
-            with contextlib.redirect_stdout(devnull):
-                return func(*a, **ka)
-
-    return wrapper
 
 
 @suppress_stdout
@@ -175,7 +166,7 @@ def local_opt(v: Vina, remove_h=True) -> tuple[Chem.Mol, float]:
 
 
 def docking(v: Vina, exhaustiveness: int = 8, remove_h=True) -> tuple[Chem.Mol, float]:
-    v.dock(8, 1)
+    v.dock(exhaustiveness, 1)
     docking_score = float(v.energies(1)[0][0])
     pose = v.poses(1)
     docked_mol = ligand_pdbqt_string_to_rdmol(pose)
