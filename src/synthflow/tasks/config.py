@@ -87,8 +87,34 @@ class PocketConditionalConfig:
 
 
 @dataclass
+class BoltzinaTaskConfig:
+    """Config for Boltzina Task
+
+    Attributes
+    ----------
+    receptor_pdb: str (path)
+        Path to predicted receptor PDB file (from Boltz-2)
+    work_dir: str (path)
+        Working directory for Boltz-2 (contains manifest.json and constraints)
+    fname: str
+        Base filename for Boltzina output files
+    batch_size: int
+        Batch size for Boltz-2 scoring
+    num_workers: int
+        Number of workers for parallel processing
+    """
+
+    receptor_pdb: str = MISSING
+    work_dir: str = MISSING
+    fname: str = "cgflow_ligand"
+    batch_size: int = 1
+    num_workers: int = 1
+
+
+@dataclass
 class TasksConfig:
     moo: MOOTaskConfig = field(default_factory=MOOTaskConfig)
     constraint: ConstraintConfig = field(default_factory=ConstraintConfig)
     docking: DockingTaskConfig = field(default_factory=DockingTaskConfig)
     pocket_conditional: PocketConditionalConfig = field(default_factory=PocketConditionalConfig)
+    boltzina: BoltzinaTaskConfig = field(default_factory=BoltzinaTaskConfig)

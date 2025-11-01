@@ -66,4 +66,4 @@ class RxnFlow3DTrainer_single(RxnFlow3DTrainer[BaseTaskT], Generic[BaseTaskT]):
             use_predicted_pose,
             num_inference_steps,
         )
-        self.ctx.set_pocket(protein_path, ref_ligand_path=ref_ligand_path)
+        self.ctx.set_pocket(protein_path, center=center, ref_ligand_path=ref_ligand_path)
