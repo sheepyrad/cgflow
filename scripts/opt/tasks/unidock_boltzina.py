@@ -7,6 +7,7 @@ from rdkit import Chem
 from rdkit.Chem import QED
 
 from gflownet.utils import sascore
+from gflownet.utils.sqlite_log import BoltzinaSQLiteLogHook
 
 from synthflow.config import Config
 from synthflow.pocket_specific.trainer import RxnFlow3DTrainer_single
@@ -27,6 +28,12 @@ class UniDockBoltzinaTask(BaseDockingTask):
         self.boltzina_fname = getattr(cfg.task.boltzina, "fname", "cgflow_ligand")
         self.boltzina_batch_size = getattr(cfg.task.boltzina, "batch_size", 1)
         self.boltzina_num_workers = getattr(cfg.task.boltzina, "num_workers", 1)
+        
+        # Storage for database logging
+        self.batch_docking_scores = []  # List of docking scores for current batch
+        self.batch_boltz_scores = []  # List of dicts with all boltz scores for current batch
+        self.batch_smiles = []  # List of SMILES for current batch
+        self.batch_iteration = None  # Current training iteration
 
     def calc_affinities(self, mols: list[Chem.Mol]) -> list[float]:
         if self.redocking:
@@ -44,20 +51,27 @@ class UniDockBoltzinaTask(BaseDockingTask):
         except Exception:
             return [0.0] * len(mols)
 
+        # Extract docking scores
+        docking_scores = []
+        docked_mols = []
+        for docked_mol, score in res:
+            docking_scores.append(score if score is not None else 0.0)
+            if docked_mol is None:
+                docked_mols.append(None)
+            else:
+                docked_mols.append(docked_mol)
+
         # Save docked structures
         output_result_path = self.save_dir / f"oracle{self.oracle_idx}_dock.sdf"
-        docked_mols = []
         with Chem.SDWriter(str(output_result_path)) as w:
-            for docked_mol, _ in res:
-                if docked_mol is None:
-                    docked_mols.append(None)
-                else:
-                    docked_mols.append(docked_mol)
+            for docked_mol in docked_mols:
+                if docked_mol is not None:
                     w.write(docked_mol)
 
-        # Step 2: Score using Boltzina
+        # Step 2: Score using Boltzina (get all scores for database)
         try:
-            affinity_results = boltzina_integration.boltzina_scoring(
+            # Get all boltz scores for database logging
+            boltz_results_all = boltzina_integration.boltzina_scoring(
                 docked_mols=docked_mols,
                 receptor_pdb=self.boltzina_receptor_pdb,
                 work_dir=self.boltzina_work_dir,
@@ -66,11 +80,25 @@ class UniDockBoltzinaTask(BaseDockingTask):
                 batch_size=self.boltzina_batch_size,
                 num_workers=self.boltzina_num_workers,
                 seed=self.cfg.seed if hasattr(self.cfg, "seed") else None,
+                return_all_scores=True,  # Get all scores for database
             )
+            
+            # Store for database logging
+            self.batch_docking_scores = docking_scores
+            self.batch_boltz_scores = boltz_results_all
+            self.batch_smiles = [Chem.MolToSmiles(mol) if mol is not None else "" for mol in mols]
 
-            # Step 3: Calculate Boltz score
+            # Step 3: Calculate Boltz score (for reward calculation)
             boltz_scores = []
-            for affinity_value1, affinity_prob1 in affinity_results:
+            for boltz_result in boltz_results_all:
+                if isinstance(boltz_result, dict):
+                    # Use model1 scores for backward compatibility
+                    affinity_value1 = boltz_result.get("affinity_model1", 0.0)
+                    affinity_prob1 = boltz_result.get("probability_model1", 0.0)
+                else:
+                    # Fallback for old format
+                    affinity_value1, affinity_prob1 = boltz_result
+                
                 # Boltz score formula: max(((-affinity_pred_value1+2)/4),0) * affinity_probability_binary1
                 normalized_aff = max(((-affinity_value1 + 2) / 4), 0.0)
                 boltz_score = normalized_aff * affinity_prob1
@@ -80,6 +108,17 @@ class UniDockBoltzinaTask(BaseDockingTask):
 
         except Exception as e:
             print(f"Error in Boltzina scoring: {e}")
+            # Store empty scores for database
+            self.batch_docking_scores = docking_scores
+            self.batch_boltz_scores = [{
+                "affinity_ensemble": 0.0,
+                "probability_ensemble": 0.0,
+                "affinity_model1": 0.0,
+                "probability_model1": 0.0,
+                "affinity_model2": 0.0,
+                "probability_model2": 0.0,
+            } for _ in mols]
+            self.batch_smiles = [Chem.MolToSmiles(mol) if mol is not None else "" for mol in mols]
             return [0.0] * len(mols)
 
 
@@ -162,6 +201,41 @@ class UniDockBoltzinaMOOTask(UniDockBoltzinaTask):
 class UniDockBoltzinaMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzinaMOOTask]):
     def setup_task(self):
         self.task = UniDockBoltzinaMOOTask(cfg=self.cfg)
+
+    def build_training_data_loader(self):
+        """Override to add BoltzinaSQLiteLogHook for separate database."""
+        from torch.utils.data import DataLoader
+        import pathlib
+        
+        # Get the parent's implementation logic
+        model = self._wrap_for_mp(self.sampling_model)
+        replay_buffer = self._wrap_for_mp(self.replay_buffer)
+
+        if self.cfg.replay.use:
+            assert self.cfg.replay.num_from_replay != 0, "Replay is enabled but no samples are being drawn from it"
+            assert self.cfg.replay.num_new_samples != 0, "Replay is enabled but no new samples are being added to it"
+
+        n_drawn = self.cfg.algo.num_from_policy
+        n_replayed = self.cfg.replay.num_from_replay or n_drawn if self.cfg.replay.use else 0
+        n_new_replay_samples = self.cfg.replay.num_new_samples or n_drawn if self.cfg.replay.use else None
+        n_from_dataset = self.cfg.algo.num_from_dataset
+
+        src = self.create_data_source(replay_buffer=replay_buffer)
+        if n_from_dataset:
+            src.do_sample_dataset(self.training_data, n_from_dataset, backwards_model=model)
+        if n_drawn:
+            src.do_sample_model(model, n_drawn, n_new_replay_samples)
+        if n_replayed and replay_buffer is not None:
+            src.do_sample_replay(n_replayed)
+        if self.cfg.log_dir:
+            # Add the standard SQLiteLogHook (from parent - uses CustomSQLiteLogHook)
+            from rxnflow.base.gflownet.sqlite_log import CustomSQLiteLogHook
+            src.add_sampling_hook(CustomSQLiteLogHook(str(pathlib.Path(self.cfg.log_dir) / "train"), self.ctx))
+            # Add the new BoltzinaSQLiteLogHook for separate database
+            src.add_sampling_hook(BoltzinaSQLiteLogHook(str(pathlib.Path(self.cfg.log_dir) / "train"), self.task))
+        for hook in self.sampling_hooks:
+            src.add_sampling_hook(hook)
+        return self._make_data_loader(src)
 
     def log(self, info, index, key):
         self.add_extra_info(info)

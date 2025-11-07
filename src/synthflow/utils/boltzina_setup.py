@@ -76,10 +76,12 @@ def generate_grid_config(
             raise ValueError("No atoms found for the specified residues.")
 
         coords = np.array(coords)
-        min_coords = coords.min(axis=0) - 5  # Add buffer
-        max_coords = coords.max(axis=0) + 5  # Add buffer
+        min_coords = coords.min(axis=0)
+        max_coords = coords.max(axis=0) 
 
-        center = (min_coords + max_coords) / 2
+        # Use center of mass (centroid) for tighter fit around target residues
+        # This positions the box more optimally to cover just the target residues
+        center = coords.mean(axis=0)
         size = max_coords - min_coords
 
         # Create configuration file for grid box

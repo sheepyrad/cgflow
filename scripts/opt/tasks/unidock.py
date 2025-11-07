@@ -27,7 +27,7 @@ class UniDockTask(BaseDockingTask):
     def run_redocking(self, mols: list[Chem.Mol]) -> list[float]:
         # unidock redocking
         try:
-            res = unidock.docking(mols, self.protein_path, self.center, search_mode="balance")
+            res = unidock.docking(mols, self.protein_path, self.center, search_mode="detail")
         except ModuleNotFoundError as e:
             raise ModuleNotFoundError(f"Unidock is not installed. Please install it using conda. {e}") from e
         except Exception:

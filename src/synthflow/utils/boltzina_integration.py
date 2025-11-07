@@ -431,7 +431,8 @@ def boltzina_scoring(
     num_workers: int = 1,
     seed: Optional[int] = None,
     prepared_mols_dict: Optional[dict] = None,
-) -> list[tuple[float, float]]:
+    return_all_scores: bool = False,
+) -> list[tuple[float, float]] | list[dict]:
     """
     Score docked molecules using Boltzina.
 
@@ -457,12 +458,22 @@ def boltzina_scoring(
         Random seed
     prepared_mols_dict : Optional[dict]
         Dictionary of prepared molecules (optional)
+    return_all_scores : bool
+        If True, returns all boltz scores (ensemble, model1, model2) as dicts.
+        If False, returns only (affinity_pred_value1, affinity_probability_binary1) tuples.
 
     Returns
     -------
-    list[tuple[float, float]]
-        List of (affinity_pred_value1, affinity_probability_binary1) tuples
-        Returns (0.0, 0.0) for molecules that fail
+    list[tuple[float, float]] | list[dict]
+        If return_all_scores=False: List of (affinity_pred_value1, affinity_probability_binary1) tuples
+        If return_all_scores=True: List of dicts with keys:
+            - affinity_ensemble: float
+            - probability_ensemble: float
+            - affinity_model1: float
+            - probability_model1: float
+            - affinity_model2: float
+            - probability_model2: float
+        Returns (0.0, 0.0) or dict with zeros for molecules that fail
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -588,6 +599,15 @@ def boltzina_scoring(
 
     if not ligand_indices:
         logger.error("All molecules failed complex creation. Returning zero scores.")
+        if return_all_scores:
+            return [{
+                "affinity_ensemble": 0.0,
+                "probability_ensemble": 0.0,
+                "affinity_model1": 0.0,
+                "probability_model1": 0.0,
+                "affinity_model2": 0.0,
+                "probability_model2": 0.0,
+            } for _ in docked_mols]
         return [(0.0, 0.0) for _ in docked_mols]
     
     logger.info(f"Created complexes for {len(ligand_indices)}/{len(docked_mols)} ligands")
@@ -659,6 +679,15 @@ def boltzina_scoring(
 
     if not ligand_files:
         logger.error("No valid ligand files for Boltzina scoring")
+        if return_all_scores:
+            return [{
+                "affinity_ensemble": 0.0,
+                "probability_ensemble": 0.0,
+                "affinity_model1": 0.0,
+                "probability_model1": 0.0,
+                "affinity_model2": 0.0,
+                "probability_model2": 0.0,
+            } for _ in docked_mols]
         return [(0.0, 0.0) for _ in docked_mols]
 
     logger.info(f"Running Boltzina scoring for {len(ligand_files)} ligands (out of {len(docked_mols)} total)")
@@ -777,7 +806,18 @@ def boltzina_scoring(
         # where ligand_idx is the enumerate index from run_scoring_only (0, 1, 2...)
         # Note: fname is now the actual record ID from manifest.json
         logger.debug("Extracting results from Boltzina output...")
-        results = [(0.0, 0.0) for _ in docked_mols]  # Initialize all to (0.0, 0.0)
+        
+        if return_all_scores:
+            results = [{
+                "affinity_ensemble": 0.0,
+                "probability_ensemble": 0.0,
+                "affinity_model1": 0.0,
+                "probability_model1": 0.0,
+                "affinity_model2": 0.0,
+                "probability_model2": 0.0,
+            } for _ in docked_mols]
+        else:
+            results = [(0.0, 0.0) for _ in docked_mols]
         
         pose_idx = "1"  # We only use one pose
         for boltz_ligand_idx, mol_idx in boltz_ligand_idx_to_mol_idx.items():
@@ -789,18 +829,66 @@ def boltzina_scoring(
                     with open(affinity_file, "r") as f:
                         affinity_data = json.load(f)
 
-                    affinity_value1 = affinity_data.get("affinity_pred_value1", 0.0)
-                    affinity_prob1 = affinity_data.get("affinity_probability_binary1", 0.0)
-                    results[mol_idx] = (float(affinity_value1), float(affinity_prob1))
-                    logger.debug(f"Ligand {mol_idx} (boltz_idx {boltz_ligand_idx}): affinity={affinity_value1}, prob={affinity_prob1}")
+                    if return_all_scores:
+                        # Extract all scores
+                        affinity_ensemble = float(affinity_data.get("affinity_pred_value", 0.0))
+                        prob_ensemble = float(affinity_data.get("affinity_probability_binary", 0.0))
+                        affinity_model1 = float(affinity_data.get("affinity_pred_value1", 0.0))
+                        prob_model1 = float(affinity_data.get("affinity_probability_binary1", 0.0))
+                        affinity_model2 = float(affinity_data.get("affinity_pred_value2", 0.0))
+                        prob_model2 = float(affinity_data.get("affinity_probability_binary2", 0.0))
+                        
+                        results[mol_idx] = {
+                            "affinity_ensemble": affinity_ensemble,
+                            "probability_ensemble": prob_ensemble,
+                            "affinity_model1": affinity_model1,
+                            "probability_model1": prob_model1,
+                            "affinity_model2": affinity_model2,
+                            "probability_model2": prob_model2,
+                        }
+                        logger.debug(f"Ligand {mol_idx} (boltz_idx {boltz_ligand_idx}): "
+                                   f"ensemble=({affinity_ensemble}, {prob_ensemble}), "
+                                   f"model1=({affinity_model1}, {prob_model1}), "
+                                   f"model2=({affinity_model2}, {prob_model2})")
+                    else:
+                        # Backward compatibility: return only model1 scores
+                        affinity_value1 = affinity_data.get("affinity_pred_value1", 0.0)
+                        affinity_prob1 = affinity_data.get("affinity_probability_binary1", 0.0)
+                        results[mol_idx] = (float(affinity_value1), float(affinity_prob1))
+                        logger.debug(f"Ligand {mol_idx} (boltz_idx {boltz_ligand_idx}): affinity={affinity_value1}, prob={affinity_prob1}")
                 except Exception as e:
                     logger.error(f"Error parsing affinity file {affinity_file}: {e}")
-                    results[mol_idx] = (0.0, 0.0)
+                    if return_all_scores:
+                        results[mol_idx] = {
+                            "affinity_ensemble": 0.0,
+                            "probability_ensemble": 0.0,
+                            "affinity_model1": 0.0,
+                            "probability_model1": 0.0,
+                            "affinity_model2": 0.0,
+                            "probability_model2": 0.0,
+                        }
+                    else:
+                        results[mol_idx] = (0.0, 0.0)
             else:
                 logger.warning(f"Affinity file not found: {affinity_file}")
-                results[mol_idx] = (0.0, 0.0)
+                if return_all_scores:
+                    results[mol_idx] = {
+                        "affinity_ensemble": 0.0,
+                        "probability_ensemble": 0.0,
+                        "affinity_model1": 0.0,
+                        "probability_model1": 0.0,
+                        "affinity_model2": 0.0,
+                        "probability_model2": 0.0,
+                    }
+                else:
+                    results[mol_idx] = (0.0, 0.0)
         
-        logger.info(f"Successfully extracted results for {len([r for r in results if r != (0.0, 0.0)])} ligands")
+        if return_all_scores:
+            num_success = len([r for r in results if r["affinity_model1"] != 0.0 or r["probability_model1"] != 0.0])
+        else:
+            num_success = len([r for r in results if r != (0.0, 0.0)])
+        
+        logger.info(f"Successfully extracted results for {num_success} ligands")
         logger.info("=" * 80)
         logger.info("Boltzina scoring completed")
         logger.info(f"Timestamp: {datetime.now().isoformat()}")
@@ -809,5 +897,14 @@ def boltzina_scoring(
 
     except Exception as e:
         logger.error(f"Error running Boltzina scoring: {e}", exc_info=True)
+        if return_all_scores:
+            return [{
+                "affinity_ensemble": 0.0,
+                "probability_ensemble": 0.0,
+                "affinity_model1": 0.0,
+                "probability_model1": 0.0,
+                "affinity_model2": 0.0,
+                "probability_model2": 0.0,
+            } for _ in docked_mols]
         return [(0.0, 0.0) for _ in docked_mols]
 

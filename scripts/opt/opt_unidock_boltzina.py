@@ -168,7 +168,7 @@ if __name__ == "__main__":
     
     config.task.docking.protein_path = str(temp_receptor_path.resolve())
     config.task.docking.center = setup_info["grid_center"]
-    config.task.docking.size = setup_info["grid_size"]
+    config.task.docking.size = [16, 16, 16]  # Cube of 16
     config.task.docking.ff_opt = "uff"
     config.task.docking.ref_ligand_path = None  # CGFlow uses center and size directly
     
@@ -240,7 +240,7 @@ if __name__ == "__main__":
     # Update config first (for consistency)
     trainer.cfg.task.docking.protein_path = str(receptor_pdb_path)
     trainer.cfg.task.docking.center = setup_info["grid_center"]
-    trainer.cfg.task.docking.size = setup_info["grid_size"]
+    trainer.cfg.task.docking.size = [16, 16, 16]  # Cube of 16
     trainer.cfg.task.docking.ff_opt = "uff"
     trainer.cfg.task.docking.ref_ligand_path = None
     trainer.cfg.task.boltzina.receptor_pdb = str(receptor_pdb_path)
@@ -249,7 +249,7 @@ if __name__ == "__main__":
     # Update task attributes directly (task reads from config in __init__, but we need to update after initialization)
     trainer.task.protein_path = receptor_pdb_path
     trainer.task.center = setup_info["grid_center"]
-    trainer.task.size = setup_info["grid_size"]
+    trainer.task.size = [16, 16, 16]  # Cube of 16
     trainer.task.ff_opt = "uff"
     trainer.task.boltzina_receptor_pdb = receptor_pdb_path
     trainer.task.boltzina_work_dir = Path(setup_info["work_dir"]).resolve()
@@ -280,7 +280,7 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"Warning: Could not remove temporary work directory {temp_work_dir}: {e}")
     
-    print(f"Using grid center {setup_info['grid_center']} and size {setup_info['grid_size']} from target residues")
+    print(f"Using grid center {setup_info['grid_center']} and size [16, 16, 16] (cube)")
     print(f"Updated task with receptor PDB path: {receptor_pdb_path}")
     
     trainer.run()

@@ -112,9 +112,35 @@ class BoltzinaTaskConfig:
 
 
 @dataclass
+class BoltzTaskConfig:
+    """Config for Boltz Co-folding Task
+
+    Attributes
+    ----------
+    base_yaml: str (path)
+        Path to Boltz-2 base.yaml config file (contains protein sequence)
+    msa_path: str (path) | None
+        Path to MSA file for Boltz-2 (optional, can be specified in base.yaml)
+    cache_dir: str (path) | None
+        Cache directory for Boltz-2 (default: ~/project/boltz_cache)
+    use_msa_server: bool
+        Whether to use MSA server for Boltz-2 (default: False)
+    target_residues: list[str] | None
+        List of target residues for pocket constraints (format: ['A:123', 'B:456'])
+    """
+
+    base_yaml: str = MISSING
+    msa_path: str | None = None
+    cache_dir: str | None = None
+    use_msa_server: bool = False
+    target_residues: list[str] | None = None
+
+
+@dataclass
 class TasksConfig:
     moo: MOOTaskConfig = field(default_factory=MOOTaskConfig)
     constraint: ConstraintConfig = field(default_factory=ConstraintConfig)
     docking: DockingTaskConfig = field(default_factory=DockingTaskConfig)
     pocket_conditional: PocketConditionalConfig = field(default_factory=PocketConditionalConfig)
     boltzina: BoltzinaTaskConfig = field(default_factory=BoltzinaTaskConfig)
+    boltz: BoltzTaskConfig = field(default_factory=BoltzTaskConfig)

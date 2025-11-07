@@ -239,6 +239,9 @@ class DataSource(IterableDataset):
         valid_idcs = torch.tensor([i for i in range(len(trajs)) if trajs[i].get("is_valid", True)]).long()
         # fetch the valid trajectories endpoints
         objs = [self.ctx.graph_to_obj(trajs[i]["result"]) for i in valid_idcs]
+        # Store current iteration in task if it has the attribute (for database logging)
+        if hasattr(self.task, "batch_iteration"):
+            self.task.batch_iteration = self.current_iter
         # ask the task to compute their reward
         # TODO: it's really weird that the task is responsible for this and returns a obj_props
         # tensor whose first dimension is possibly not the same as the output???

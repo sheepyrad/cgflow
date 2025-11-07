@@ -47,8 +47,8 @@ boltzina:
   # Format: ['A:123', 'B:456'] where A/B is chain ID and 123/456 is residue number
   # Example for NS5 binding site residues 
   target_residues: # [[A, 17], [A, 57], [A, 138], [A, 153], [A, 184], [A, 185]] for NS5_crop_renum.pdb
-    - "A:17"  
-    - "A:57"  
+    - "A:16"  
+    - "A:67"  
     - "A:138"  
     - "A:153"  
     - "A:184" 

@@ -1,0 +1,44 @@
+# save dir
+result_dir: "./result/opt/unidock_boltz/NS5"
+
+# environment
+env_dir: ./data/envs/enamine_stock_new
+max_atoms: 60 # maximum atom counts
+subsampling_ratio: 0.1 # Memory-variance trade-off
+
+# docking (needed for pocket context - defines where to generate molecules)
+protein_path: ./data/examples/NS5_crop.pdb  # Required: Protein structure for pocket context
+center: null  # Will be calculated from target_residues if provided, otherwise use ref_ligand_path
+ref_ligand_path: ./data/examples/NS5_crop_ligand.mol2  # Optional: Used to calculate center if target_residues not provided
+size: [16, 16, 16]  # Size for pocket extraction
+
+# opt
+num_steps: 2000
+num_sampling_per_step: 32
+temperature: [1, 64] # uniform(1, 64)
+seed: 1
+
+# pose prediction
+pose_model: "./weights/cgflow_crossdock.ckpt"
+pose_steps: 40
+
+# extras
+sampling_tau: 0.9 # EMA
+random_action_prob: 0.05 # suggest to set positive value
+replay_warmup_step: 10 # 10 steps
+replay_capacity: 6400
+
+# boltz co-folding asreward function
+boltz:
+  base_yaml: ./data/examples/NS5_crop_renum.yaml
+  target_residues:
+    - "A:16"  
+    - "A:67"  
+    - "A:138"  
+    - "A:153"  
+    - "A:184" 
+    - "A:185"  
+  msa_path: ./data/examples/NS5_crop.a3m
+  cache_dir: null
+  use_msa_server: false
+

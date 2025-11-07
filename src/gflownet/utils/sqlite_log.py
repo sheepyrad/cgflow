@@ -114,3 +114,101 @@ def read_all_results(path):
         for i in range(num_workers)
     ]
     return pd.concat(dfs).sort_index().reset_index(drop=True)
+
+
+class BoltzinaSQLiteLogHook:
+    """
+    Separate database hook for storing SMILES, docking scores, and all boltz scores.
+    Creates a separate database file: boltzina_scores_{worker_id}.db
+    """
+    def __init__(self, log_dir, task) -> None:
+        self.log = None  # Only initialized in __call__, which will occur inside the worker
+        self.log_dir = log_dir
+        self.task = task
+        self.data_labels = None
+
+    def __call__(self, trajs, rewards, obj_props, cond_info):
+        # Only log if task has boltzina scores (i.e., it's a UniDockBoltzinaTask)
+        if not hasattr(self.task, "batch_smiles") or not self.task.batch_smiles:
+            return {}
+        
+        if self.log is None:
+            worker_info = torch.utils.data.get_worker_info()
+            self._wid = worker_info.id if worker_info is not None else 0
+            os.makedirs(self.log_dir, exist_ok=True)
+            self.log_path = f"{self.log_dir}/boltzina_scores_{self._wid}.db"
+            self.log = SQLiteLog()
+            self.log.connect(self.log_path)
+
+        # Get data from task
+        smiles_list = self.task.batch_smiles
+        docking_scores = self.task.batch_docking_scores
+        boltz_scores = self.task.batch_boltz_scores
+        
+        # Get iteration from task or cond_info
+        # Try to get from task first (set when batch data is computed)
+        iteration = getattr(self.task, "batch_iteration", None)
+        # If not in task, try to get from cond_info (if stored there)
+        if iteration is None and "train_it" in cond_info:
+            iteration = cond_info["train_it"][0].item() if len(cond_info["train_it"]) > 0 else None
+        # Fallback: use 0 if not available
+        if iteration is None:
+            iteration = 0
+
+        # Ensure all lists have the same length
+        min_len = min(len(smiles_list), len(docking_scores), len(boltz_scores))
+        if min_len == 0:
+            return {}
+
+        # Prepare data rows
+        data = []
+        for i in range(min_len):
+            smiles = smiles_list[i] if i < len(smiles_list) else ""
+            docking_score = docking_scores[i] if i < len(docking_scores) else 0.0
+            
+            # Extract boltz scores
+            boltz_result = boltz_scores[i] if i < len(boltz_scores) else {}
+            if isinstance(boltz_result, dict):
+                affinity_ensemble = boltz_result.get("affinity_ensemble", 0.0)
+                prob_ensemble = boltz_result.get("probability_ensemble", 0.0)
+                affinity_model1 = boltz_result.get("affinity_model1", 0.0)
+                prob_model1 = boltz_result.get("probability_model1", 0.0)
+                affinity_model2 = boltz_result.get("affinity_model2", 0.0)
+                prob_model2 = boltz_result.get("probability_model2", 0.0)
+            else:
+                # Fallback for old format
+                affinity_ensemble = 0.0
+                prob_ensemble = 0.0
+                affinity_model1, prob_model1 = boltz_result if isinstance(boltz_result, tuple) else (0.0, 0.0)
+                affinity_model2 = 0.0
+                prob_model2 = 0.0
+
+            data.append([
+                int(iteration),  # iteration number
+                smiles,
+                float(docking_score),
+                float(affinity_ensemble),
+                float(prob_ensemble),
+                float(affinity_model1),
+                float(prob_model1),
+                float(affinity_model2),
+                float(prob_model2),
+            ])
+
+        if self.data_labels is None:
+            self.data_labels = [
+                "iteration",
+                "smiles",
+                "docking_score",
+                "affinity_ensemble",
+                "probability_ensemble",
+                "affinity_model1",
+                "probability_model1",
+                "affinity_model2",
+                "probability_model2",
+            ]
+
+        if data:
+            self.log.insert_many(data, self.data_labels)
+        
+        return {}
