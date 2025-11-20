@@ -2,7 +2,6 @@ from collections import OrderedDict
 from pathlib import Path
 import json
 import subprocess
-import tempfile
 import yaml
 
 import numpy as np
@@ -16,7 +15,6 @@ from gflownet.utils.sqlite_log import BoltzinaSQLiteLogHook
 
 from synthflow.config import Config
 from synthflow.pocket_specific.trainer import RxnFlow3DTrainer_single
-from synthflow.utils.conda_env import run_in_conda_env
 from synthflow.utils.boltz_reward_cache import BoltzRewardCache
 
 from .docking import BaseDockingTask
@@ -178,6 +176,41 @@ class UniDockBoltzTask(BaseDockingTask):
             mol_idx = smiles_to_indices[smiles][0]  # Use first occurrence
             mol = valid_mols[valid_indices.index(mol_idx)]
             
+            # Check Lilly filter FIRST (before expensive Boltz calculation)
+            # Since Lilly is binary (0 or 1), if it fails, we can skip Boltz entirely
+            try:
+                lily_mask = mc.functional.lilly_demerit_filter(
+                    mols=[Chem.MolFromSmiles(smiles)], 
+                    n_jobs=-1, 
+                    progress=False, 
+                    return_idx=False
+                )
+                assert len(lily_mask.shape) == 1, "Lilly mask should be a 1D array"
+                assert lily_mask.shape[0] == 1, "Lilly mask should have only one element"
+                lily_mask = float(lily_mask[0])
+                assert lily_mask == 0.0 or lily_mask == 1.0, "Lilly mask should be 0.0 or 1.0"
+            except Exception as e:
+                print(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
+                lily_mask = 0.0
+            
+            # If Lilly filter fails, skip Boltz calculation and return 0.0
+            if lily_mask == 0.0:
+                result = {
+                    "affinity_ensemble": 0.0,
+                    "probability_ensemble": 0.0,
+                    "affinity_model1": 0.0,
+                    "probability_model1": 0.0,
+                    "affinity_model2": 0.0,
+                    "probability_model2": 0.0,
+                }
+                boltz_score = 0.0
+                results_dict[smiles] = (boltz_score, result)
+                # Still cache the result to avoid re-checking Lilly in future
+                info_str = json.dumps(result)
+                new_cache_entries.append((smiles, boltz_score, info_str))
+                continue
+            
+            # Lilly passed (lily_mask == 1.0), proceed with Boltz calculation
             try:
                 # Create temporary directory for this molecule
                 mol_temp_dir = batch_output_dir / f"mol_{mol_idx}"
@@ -201,22 +234,7 @@ class UniDockBoltzTask(BaseDockingTask):
                     affinity_prob1 = result.get("probability_model1", 0.0)
                     normalized_aff = max(0.0, (affinity_value1 * -1 + 2.0) / 4.0)
                     
-                    # Apply Lilly medchem filter (like synflownet-boltz)
-                    try:
-                        lily_mask = mc.functional.lilly_demerit_filter(
-                            mols=[Chem.MolFromSmiles(smiles)], 
-                            n_jobs=-1, 
-                            progress=False, 
-                            return_idx=False
-                        )
-                        assert len(lily_mask.shape) == 1, "Lilly mask should be a 1D array"
-                        assert lily_mask.shape[0] == 1, "Lilly mask should have only one element"
-                        lily_mask = float(lily_mask[0])
-                        assert lily_mask == 0.0 or lily_mask == 1.0, "Lilly mask should be 0.0 or 1.0"
-                    except Exception as e:
-                        print(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
-                        lily_mask = 0.0
-                    
+                    # Apply Lilly mask (already checked above, should be 1.0)
                     boltz_score = float(normalized_aff * affinity_prob1 * lily_mask)
                     
                     results_dict[smiles] = (boltz_score, result)
@@ -349,17 +367,17 @@ class UniDockBoltzTask(BaseDockingTask):
             yaml.dump(yaml_dict, f, Dumper=yaml.SafeDumper, default_flow_style=False, sort_keys=False)
     
     def _run_boltz_prediction(self, yaml_input_path: Path, output_dir: Path):
-        """Run Boltz-2 prediction command in boltz-env conda environment.
+        """Run Boltz-2 prediction command directly (no conda subprocess).
         
-        Note: boltz predict accepts a YAML file path directly (like boltzina_setup.py).
-        We pass the YAML file path, not a directory.
+        Note: boltz predict accepts a YAML file path directly.
+        This requires Boltz to be installed in the trainer environment.
         """
         # Use absolute paths
         yaml_input_path = yaml_input_path.resolve()
         output_dir = output_dir.resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # boltz predict accepts a YAML file directly (not a directory)
+        # Build boltz predict command
         cmd = ["boltz", "predict", str(yaml_input_path), "--out_dir", str(output_dir), "--output_format", "pdb"]
         
         # Add cache directory if specified
@@ -372,14 +390,19 @@ class UniDockBoltzTask(BaseDockingTask):
             cmd.append("--use_msa_server")
         
         try:
-            # Run boltz command in boltz-env conda environment
-            result = run_in_conda_env(
+            # Set environment variables for GPU memory management
+            import os
+            env_vars = os.environ.copy()
+            env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+            
+            # Run boltz command directly (no conda wrapper)
+            result = subprocess.run(
                 cmd,
-                conda_env="boltz-env",
-                cwd=None,  # Use current working directory
+                cwd=None,
                 check=True,
                 capture_output=True,
                 text=True,
+                env=env_vars,
             )
             if result.stdout:
                 print(f"Boltz-2 prediction stdout: {result.stdout[:500]}")  # Print first 500 chars
@@ -387,6 +410,13 @@ class UniDockBoltzTask(BaseDockingTask):
             error_msg = e.stderr if e.stderr else (e.stdout if hasattr(e, 'stdout') else str(e))
             print(f"Boltz-2 prediction failed: {error_msg}")
             raise
+        finally:
+            # Clean up GPU memory after prediction
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
     
     def _extract_boltz_results(self, boltz_output_dir: Path, query_name: str) -> dict | None:
         """Extract affinity results from Boltz-2 output.

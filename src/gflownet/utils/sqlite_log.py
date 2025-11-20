@@ -119,16 +119,30 @@ def read_all_results(path):
 class BoltzinaSQLiteLogHook:
     """
     Separate database hook for storing SMILES, docking scores, and all boltz scores.
-    Creates a separate database file: boltzina_scores_{worker_id}.db
+    Creates a separate database file:
+    - boltzina_scores_{worker_id}.db for UniDockBoltzinaTask
+    - boltz_scores_{worker_id}.db for UniDockBoltzTask
     """
     def __init__(self, log_dir, task) -> None:
         self.log = None  # Only initialized in __call__, which will occur inside the worker
         self.log_dir = log_dir
         self.task = task
         self.data_labels = None
+        
+        # Determine database name based on task type
+        task_class_name = task.__class__.__name__
+        if "Boltzina" in task_class_name:
+            # UniDockBoltzinaTask or UniDockBoltzinaMOOTask
+            self.db_prefix = "boltzina_scores"
+        elif "Boltz" in task_class_name:
+            # UniDockBoltzTask or UniDockBoltzMOOTask
+            self.db_prefix = "boltz_scores"
+        else:
+            # Default to boltzina for backward compatibility
+            self.db_prefix = "boltzina_scores"
 
     def __call__(self, trajs, rewards, obj_props, cond_info):
-        # Only log if task has boltzina scores (i.e., it's a UniDockBoltzinaTask)
+        # Only log if task has batch_smiles (i.e., it's a UniDockBoltzinaTask or UniDockBoltzTask)
         if not hasattr(self.task, "batch_smiles") or not self.task.batch_smiles:
             return {}
         
@@ -136,7 +150,7 @@ class BoltzinaSQLiteLogHook:
             worker_info = torch.utils.data.get_worker_info()
             self._wid = worker_info.id if worker_info is not None else 0
             os.makedirs(self.log_dir, exist_ok=True)
-            self.log_path = f"{self.log_dir}/boltzina_scores_{self._wid}.db"
+            self.log_path = f"{self.log_dir}/{self.db_prefix}_{self._wid}.db"
             self.log = SQLiteLog()
             self.log.connect(self.log_path)
 

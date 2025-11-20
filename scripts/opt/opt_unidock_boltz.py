@@ -100,6 +100,8 @@ if __name__ == "__main__":
     except (AttributeError, KeyError):
         config.task.moo.objectives = ["boltz"]  # Default to just boltz (which includes lilly filter)
     config.print_every = 10
+    config.checkpoint_every = 100
+    config.store_all_checkpoints = True
     config.num_workers_retrosynthesis = 4
 
     time = datetime.datetime.now().strftime("%y%m%d_%H%M%S")

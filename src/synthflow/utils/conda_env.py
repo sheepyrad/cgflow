@@ -13,6 +13,7 @@ def run_in_conda_env(
     capture_output: bool = True,
     text: bool = True,
     shell: bool = False,
+    env: Optional[dict[str, str]] = None,
 ) -> subprocess.CompletedProcess:
     """
     Run a command in a specific conda environment.
@@ -59,6 +60,14 @@ def run_in_conda_env(
         "--no-capture-output",
     ] + cmd
 
+    # Merge with current environment if env is provided
+    import os
+    if env is not None:
+        full_env = os.environ.copy()
+        full_env.update(env)
+    else:
+        full_env = None
+    
     return subprocess.run(
         conda_run_cmd,
         cwd=cwd,
@@ -66,6 +75,7 @@ def run_in_conda_env(
         capture_output=capture_output,
         text=text,
         shell=shell,
+        env=full_env,
     )
 
 
