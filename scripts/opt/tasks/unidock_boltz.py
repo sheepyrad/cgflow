@@ -20,6 +20,11 @@ from synthflow.utils.boltz_reward_cache import BoltzRewardCache
 from .docking import BaseDockingTask
 
 
+# Module-level variables for resume mode (set by opt_unidock_boltz.py before trainer instantiation)
+_RESUME_MODE: bool = False
+_RESUME_ORACLE_IDX: int | None = None
+
+
 class UniDockBoltzTask(BaseDockingTask):
     """Task for co-folding ligand and protein using Boltz-2."""
     
@@ -30,6 +35,11 @@ class UniDockBoltzTask(BaseDockingTask):
         self.boltz_msa_path = getattr(cfg.task.boltz, "msa_path", None)
         self.boltz_output_dir = Path(cfg.log_dir) / "boltz_cofold"
         self.boltz_output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set oracle_idx from module-level variable if resuming
+        if _RESUME_ORACLE_IDX is not None:
+            self.oracle_idx = _RESUME_ORACLE_IDX
+            print(f"Resuming with oracle_idx starting at: {self.oracle_idx}")
         self.boltz_cache_dir = getattr(cfg.task.boltz, "cache_dir", "~/project/boltz_cache")
         self.boltz_use_msa_server = getattr(cfg.task.boltz, "use_msa_server", False)
         self.boltz_target_residues = getattr(cfg.task.boltz, "target_residues", None)
@@ -75,6 +85,38 @@ class UniDockBoltzTask(BaseDockingTask):
                     if isinstance(protein_data, dict) and "msa" in protein_data:
                         self.boltz_msa_path = protein_data["msa"]
                         break
+        
+        # Restore topn_affinity if resuming (do this after parent __init__ sets it up)
+        if _RESUME_MODE:
+            restored = self.restore_topn_from_cache()
+            if restored:
+                self.topn_affinity = restored
+
+    def restore_topn_from_cache(self) -> OrderedDict[str, float] | None:
+        """Load top N molecules from boltz_reward_cache.db on resume."""
+        cache_path = Path(self.cfg.log_dir) / "boltz_reward_cache.db"
+        if not cache_path.exists():
+            return None
+        
+        try:
+            import sqlite3
+            conn = sqlite3.connect(str(cache_path))
+            cursor = conn.cursor()
+            # Table is named 'entries' in BoltzRewardCache
+            cursor.execute("""
+                SELECT smiles, reward FROM entries 
+                ORDER BY reward DESC 
+                LIMIT 1000
+            """)
+            results = cursor.fetchall()
+            conn.close()
+            
+            topn = OrderedDict((smiles, reward) for smiles, reward in results)
+            print(f"Restored {len(topn)} top molecules from reward cache")
+            return topn
+        except Exception as e:
+            print(f"Warning: Failed to restore topn_affinity from cache: {e}")
+            return None
 
     def calc_affinities(self, mols: list[Chem.Mol]) -> list[float]:
         """Co-fold ligand and protein using Boltz-2 for each molecule."""
@@ -378,7 +420,7 @@ class UniDockBoltzTask(BaseDockingTask):
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Build boltz predict command
-        cmd = ["boltz", "predict", str(yaml_input_path), "--out_dir", str(output_dir), "--output_format", "pdb"]
+        cmd = ["boltz", "predict", str(yaml_input_path), "--out_dir", str(output_dir), "--output_format", "pdb", "--use_potentials"]
         
         # Add cache directory if specified
         if self.boltz_cache_dir:
@@ -582,6 +624,49 @@ class UniDockBoltzMOOTask(UniDockBoltzTask):
 
 
 class UniDockBoltzMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzMOOTask]):
+    def setup(self):
+        """Override setup to skip directory deletion when resuming."""
+        if _RESUME_MODE:
+            # Resume mode: don't delete anything, just ensure directories exist
+            import os
+            from rdkit import RDLogger
+            from gflownet.utils.misc import set_worker_rng_seed
+            from rxnflow.utils.misc import set_worker_env
+            
+            os.makedirs(self.cfg.log_dir, exist_ok=True)
+            RDLogger.DisableLog("rdApp.*")
+            torch.manual_seed(self.cfg.seed + 42)
+            torch.cuda.manual_seed(self.cfg.seed + 42)
+            set_worker_rng_seed(self.cfg.seed)
+            
+            # Set num_objectives before setup (like parent does)
+            self.cfg.cond.moo.num_objectives = len(self.cfg.task.moo.objectives)
+            
+            self.setup_env()
+            self.setup_data()
+            self.setup_task()
+            self.setup_env_context()
+            self.setup_algo()
+            self.setup_model()
+            self.setup_replay_buffer()
+            self.setup_online()
+            
+            # Load checkpoint
+            if self.cfg.pretrained_model_path is not None:
+                self.load_checkpoint(self.cfg.pretrained_model_path)
+            
+            # Setup multi-objective optimization flag
+            self.is_moo: bool = self.task.is_moo
+            
+            # Register worker environment (critical for model forward pass)
+            set_worker_env("trainer", self)
+            set_worker_env("env", self.env)
+            set_worker_env("ctx", self.ctx)
+            set_worker_env("algo", self.algo)
+            set_worker_env("task", self.task)
+        else:
+            super().setup()
+    
     def setup_task(self):
         self.task = UniDockBoltzMOOTask(cfg=self.cfg)
 

@@ -39,7 +39,7 @@ class BaseDockingTask(BaseTask, ABC):
         )
 
         self.save_dir: Path = Path(cfg.log_dir) / "pose"
-        self.save_dir.mkdir()
+        self.save_dir.mkdir(exist_ok=True)
 
         self.topn_affinity: OrderedDict[str, float] = OrderedDict()
         self.batch_affinity: list[float] = []

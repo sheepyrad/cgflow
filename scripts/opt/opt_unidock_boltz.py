@@ -1,6 +1,7 @@
 import argparse
 import datetime
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ src_dir = script_dir / "src"
 if str(src_dir) not in sys.path:
     sys.path.insert(0, str(src_dir))
 
+import torch
 from omegaconf import DictConfig, OmegaConf
 
 from synthflow.config import Config, init_empty
@@ -60,6 +62,14 @@ def parse_args() -> DictConfig:
     parser.add_argument("--boltz_use_msa_server", action="store_true", help="Use MSA server for Boltz-2 (default: False).")
     parser.add_argument("--boltz_target_residues", type=str, nargs="+", help="Target residues for pocket constraints (format: 'A:123'). Optional.")
     parser.add_argument("--boltz_reward_cache_path", type=str, help="Path to reward cache database (default: {result_dir}/{time}/boltz_reward_cache.db).")
+    
+    # resume training
+    parser.add_argument("--resume_from", type=str, help="Path to checkpoint file to resume training from (e.g., model_state_200.pt).")
+    parser.add_argument(
+        "--resume_oracle_idx", 
+        type=int, 
+        help="Override starting oracle_idx when resuming. If not provided, will scan directories and prompt if mismatch detected."
+    )
 
     args = parser.parse_args()
 
@@ -80,6 +90,184 @@ def parse_args() -> DictConfig:
             else:
                 param[key] = value
     return param
+
+
+def get_max_oracle_idx(log_dir: Path) -> int:
+    """Find the maximum oracle_idx from existing boltz_cofold and pose directories."""
+    max_idx = 0
+    for subdir in ["boltz_cofold", "pose"]:
+        dir_path = log_dir / subdir
+        if dir_path.exists():
+            for item in dir_path.iterdir():
+                if item.name.startswith("oracle"):
+                    try:
+                        # Handle both "oracle123" and "oracle123_something"
+                        idx_str = item.name.replace("oracle", "").split("_")[0]
+                        idx = int(idx_str)
+                        max_idx = max(max_idx, idx)
+                    except ValueError:
+                        continue
+    return max_idx
+
+
+def detect_data_loss_offset(log_dir: Path) -> int | None:
+    """
+    Analyze train.log to detect data loss by finding iteration jumps or multiple 'Starting training' entries.
+    
+    Returns the estimated number of oracles lost, or None if no data loss detected.
+    """
+    log_file = log_dir / "train.log"
+    if not log_file.exists():
+        return None
+    
+    try:
+        with open(log_file, "r") as f:
+            lines = f.readlines()
+        
+        # Look for multiple "Starting training" entries (indicates resume with data loss)
+        starting_training_indices = [i for i, line in enumerate(lines) if "Starting training" in line]
+        
+        if len(starting_training_indices) <= 1:
+            return None  # No data loss detected
+        
+        # Get the last "Starting training" index
+        last_start_idx = starting_training_indices[-1]
+        
+        # Find the iteration number just before the last "Starting training"
+        last_iter_before_resume = None
+        for i in range(last_start_idx - 1, -1, -1):
+            line = lines[i]
+            if "iteration" in line and ":" in line:
+                try:
+                    parts = line.split("iteration")[1].split(":")[0].strip()
+                    last_iter_before_resume = int(parts)
+                    break
+                except (ValueError, IndexError):
+                    continue
+        
+        if last_iter_before_resume is None:
+            return None
+        
+        # The offset is the last iteration number before the data loss
+        # For example: if iteration 200 was the last before resume, 200 oracles were lost
+        return last_iter_before_resume
+        
+    except Exception as e:
+        print(f"Warning: Could not analyze train.log for data loss: {e}")
+        return None
+
+
+def validate_oracle_idx(log_dir: Path, checkpoint_step: int, user_override: int | None) -> int:
+    """
+    Validate and determine the correct starting oracle_idx.
+    
+    Returns the oracle_idx to use (next iteration will be oracle_idx + 1).
+    """
+    scanned_max = get_max_oracle_idx(log_dir)
+    
+    # If user provided override, use it
+    if user_override is not None:
+        print(f"Using user-provided oracle_idx: {user_override}")
+        return user_override - 1  # Return idx so next oracle is user_override
+    
+    # Check for mismatch
+    if scanned_max != checkpoint_step:
+        print("\n" + "="*60)
+        print("WARNING: Oracle index mismatch detected!")
+        print("="*60)
+        print(f"  Checkpoint step:        {checkpoint_step}")
+        print(f"  Max oracle in dirs:     {scanned_max}")
+        print()
+        
+        # Try to detect data loss offset from train.log
+        data_loss_offset = detect_data_loss_offset(log_dir)
+        
+        if scanned_max > checkpoint_step:
+            # Training ran past checkpoint, need to backup extra oracles
+            print("Training continued past the checkpoint before stopping.")
+            print(f"  Oracles {checkpoint_step + 1} to {scanned_max} exist and will be backed up.")
+            print()
+            print("Options:")
+            print(f"  - Use {checkpoint_step + 1} to resume from checkpoint (backs up oracles {checkpoint_step + 1}-{scanned_max})")
+            print(f"  - Use {scanned_max + 1} to continue from existing data (no backup needed)")
+            default = checkpoint_step + 1
+        else:
+            # Previous data loss
+            print("This mismatch may indicate previous data loss.")
+            
+            if data_loss_offset is not None:
+                # Infer the correct starting point
+                corrected_idx = checkpoint_step + 1
+                print(f"  Detected data loss offset from train.log: {data_loss_offset} oracles")
+                print(f"  Max oracle in dirs ({scanned_max}) + offset ({data_loss_offset}) = {scanned_max + data_loss_offset}")
+                print()
+                print("Suggested action:")
+                print(f"  - Use {corrected_idx} (recommended: resume from checkpoint, accounting for data loss)")
+                default = corrected_idx
+            else:
+                print("Options:")
+                print(f"  - Use {scanned_max + 1} to continue from existing data")
+                print(f"  - Use {checkpoint_step + 1} to match checkpoint step")
+                default = scanned_max + 1
+        
+        print()
+        
+        while True:
+            try:
+                user_input = input(f"Enter starting oracle_idx [{default}]: ").strip()
+                if user_input == "":
+                    return default - 1
+                return int(user_input) - 1  # Return the idx that will produce next oracle
+            except ValueError:
+                print("Please enter a valid integer.")
+    
+    return scanned_max
+
+
+def backup_oracles_if_needed(log_dir: Path, resume_oracle_idx: int, scanned_max: int):
+    """
+    Backup oracles that would be overwritten when resuming.
+    
+    If resume_oracle_idx <= scanned_max, oracles from resume_oracle_idx to scanned_max
+    will be moved to a timestamped backup folder.
+    """
+    if resume_oracle_idx > scanned_max:
+        return  # No backup needed
+    
+    # Create timestamped backup folder
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_dir = log_dir / f"oracle_backup_{timestamp}"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\nBacking up oracles {resume_oracle_idx} to {scanned_max}...")
+    print(f"Backup location: {backup_dir}")
+    
+    backed_up_count = 0
+    for subdir in ["boltz_cofold", "pose"]:
+        src_dir = log_dir / subdir
+        if not src_dir.exists():
+            continue
+        
+        backup_subdir = backup_dir / subdir
+        backup_subdir.mkdir(parents=True, exist_ok=True)
+        
+        for item in src_dir.iterdir():
+            if item.name.startswith("oracle"):
+                try:
+                    # Extract oracle index from name
+                    idx_str = item.name.replace("oracle", "").split("_")[0]
+                    idx = int(idx_str)
+                    
+                    # Backup if it would be overwritten
+                    if resume_oracle_idx <= idx <= scanned_max:
+                        dest = backup_subdir / item.name
+                        import shutil
+                        shutil.move(str(item), str(dest))
+                        backed_up_count += 1
+                except ValueError:
+                    continue
+    
+    print(f"Backed up {backed_up_count} oracle directories to {backup_dir}")
 
 
 if __name__ == "__main__":
@@ -104,11 +292,54 @@ if __name__ == "__main__":
     config.store_all_checkpoints = True
     config.num_workers_retrosynthesis = 4
 
-    time = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
-    config.log_dir = os.path.join(param.result_dir, time)
-    
-    # Set overwrite_existing_exp=True to allow overwriting if directory exists
-    config.overwrite_existing_exp = True
+    # Handle resume from checkpoint
+    resume_from = OmegaConf.select(param, "resume_from", default=None)
+    if resume_from:
+        checkpoint_path = Path(resume_from).resolve()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint file not found: {checkpoint_path}")
+        
+        # Set log_dir to the directory containing the checkpoint
+        log_dir = checkpoint_path.parent
+        config.log_dir = str(log_dir)
+        print(f"Using existing log directory: {config.log_dir}")
+        
+        # Extract checkpoint step from filename (e.g., model_state_1500.pt -> 1500)
+        checkpoint_step = int(checkpoint_path.stem.split("_")[-1])
+        
+        # Get max oracle in directories
+        scanned_max = get_max_oracle_idx(log_dir)
+        
+        # Validate oracle_idx (will prompt user if mismatch detected)
+        user_override = OmegaConf.select(param, "resume_oracle_idx", default=None)
+        resume_oracle_idx = validate_oracle_idx(log_dir, checkpoint_step, user_override)
+        
+        # Backup oracles that would be overwritten
+        backup_oracles_if_needed(log_dir, resume_oracle_idx + 1, scanned_max)
+        
+        # Set resume configuration
+        config.start_at_step = checkpoint_step
+        config.pretrained_model_path = str(checkpoint_path)
+        
+        # CRITICAL: Never delete on resume!
+        config.overwrite_existing_exp = False
+        
+        # Store resume info for trainer
+        resume_mode = True
+        resume_oracle_idx_value = resume_oracle_idx + 1  # Next oracle to create
+        
+        print(f"Resuming from checkpoint step {checkpoint_step}, starting oracle_idx at {resume_oracle_idx_value}")
+    else:
+        time = datetime.datetime.now().strftime("%y%m%d_%H%M%S")
+        config.log_dir = os.path.join(param.result_dir, time)
+        
+        # Set overwrite_existing_exp=True to allow overwriting if directory exists
+        config.overwrite_existing_exp = True
+        config.start_at_step = 0
+        
+        # Not resuming
+        resume_mode = False
+        resume_oracle_idx_value = None
 
     # Validate boltz configuration
     boltz_base_yaml = OmegaConf.select(param, "boltz.base_yaml", default=None)
@@ -208,7 +439,12 @@ if __name__ == "__main__":
     config.replay.capacity = param.replay_capacity
     config.replay.num_from_replay = config.algo.num_from_policy  # buffer sampling size
 
-    # Initialize trainer
+    # Set module-level resume flags before instantiation
+    import tasks.unidock_boltz as unidock_boltz_module
+    unidock_boltz_module._RESUME_MODE = resume_mode
+    unidock_boltz_module._RESUME_ORACLE_IDX = resume_oracle_idx_value
+    
+    # Initialize trainer (no database restoration needed - we never deleted anything!)
     trainer = UniDockBoltzMOOTrainer(config)
     
     print(f"Using Boltz co-folding with base YAML: {boltz_base_yaml}")
