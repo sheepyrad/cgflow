@@ -204,6 +204,8 @@ class UniDockBoltzTask(BaseDockingTask):
                     "probability_model1": info_dict.get("probability_model1", 0.0),
                     "affinity_model2": info_dict.get("affinity_model2", 0.0),
                     "probability_model2": info_dict.get("probability_model2", 0.0),
+                    "oracle_idx": info_dict.get("oracle_idx", None),
+                    "mol_idx": info_dict.get("mol_idx", None),
                 }
                 results_dict[smiles] = (reward, result)
             except Exception as e:
@@ -244,6 +246,8 @@ class UniDockBoltzTask(BaseDockingTask):
                     "probability_model1": 0.0,
                     "affinity_model2": 0.0,
                     "probability_model2": 0.0,
+                    "oracle_idx": self.oracle_idx,
+                    "mol_idx": mol_idx,
                 }
                 boltz_score = 0.0
                 results_dict[smiles] = (boltz_score, result)
@@ -271,6 +275,9 @@ class UniDockBoltzTask(BaseDockingTask):
                 result = self._extract_boltz_results(boltz_output_dir, query_name)
                 
                 if result is not None:
+                    # Attach indices for downstream visualization
+                    result["oracle_idx"] = self.oracle_idx
+                    result["mol_idx"] = mol_idx
                     # Calculate Boltz score matching synflownet-boltz formula
                     affinity_value1 = result.get("affinity_model1", 0.0)
                     affinity_prob1 = result.get("probability_model1", 0.0)
@@ -293,6 +300,8 @@ class UniDockBoltzTask(BaseDockingTask):
                         "probability_model1": 0.0,
                         "affinity_model2": 0.0,
                         "probability_model2": 0.0,
+                        "oracle_idx": self.oracle_idx,
+                        "mol_idx": mol_idx,
                     }
                     results_dict[smiles] = (0.0, result)
                     info_str = json.dumps(result)
@@ -307,6 +316,8 @@ class UniDockBoltzTask(BaseDockingTask):
                     "probability_model1": 0.0,
                     "affinity_model2": 0.0,
                     "probability_model2": 0.0,
+                    "oracle_idx": self.oracle_idx,
+                    "mol_idx": mol_idx,
                 }
                 results_dict[smiles] = (0.0, result)
                 info_str = json.dumps(result)
@@ -718,4 +729,3 @@ class UniDockBoltzMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzMOOTask]):
         for topn in [10, 100, 1000]:
             if len(best_boltz) > topn:
                 info[f"top{topn}_boltz"] = np.mean(best_boltz[:topn])
-
