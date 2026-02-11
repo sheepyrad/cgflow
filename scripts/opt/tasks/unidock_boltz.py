@@ -271,6 +271,8 @@ class UniDockBoltzTask(BaseDockingTask):
                     "probability_model1": info_dict.get("probability_model1", 0.0),
                     "affinity_model2": info_dict.get("affinity_model2", 0.0),
                     "probability_model2": info_dict.get("probability_model2", 0.0),
+                    "oracle_idx": info_dict.get("oracle_idx", None),
+                    "mol_idx": info_dict.get("mol_idx", None),
                 }
                 results_dict[smiles] = (reward, result)
             except Exception as e:
@@ -777,4 +779,3 @@ class UniDockBoltzMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzMOOTask]):
         for topn in [10, 100, 1000]:
             if len(best_boltz) > topn:
                 info[f"top{topn}_boltz"] = np.mean(best_boltz[:topn])
-
