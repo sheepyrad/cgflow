@@ -127,6 +127,8 @@ class BoltzTaskConfig:
         Whether to use MSA server for Boltz-2 (default: False)
     target_residues: list[str] | None
         List of target residues for pocket constraints (format: ['A:123', 'B:456'])
+    worker: int
+        Number of parallel Boltz prediction workers
     """
 
     base_yaml: str = MISSING
@@ -134,6 +136,7 @@ class BoltzTaskConfig:
     cache_dir: str | None = None
     use_msa_server: bool = False
     target_residues: list[str] | None = None
+    worker: int = 1
 
 
 @dataclass

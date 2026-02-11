@@ -60,6 +60,7 @@ def parse_args() -> DictConfig:
     parser.add_argument("--boltz_msa_path", type=str, help="Path to MSA file for Boltz-2 (optional, can be specified in base.yaml).")
     parser.add_argument("--boltz_cache_dir", type=str, help="Cache directory for Boltz-2 (default: ~/project/boltz_cache).")
     parser.add_argument("--boltz_use_msa_server", action="store_true", help="Use MSA server for Boltz-2 (default: False).")
+    parser.add_argument("--boltz_worker", type=int, help="Number of Boltz prediction workers (default: 1).")
     parser.add_argument("--boltz_target_residues", type=str, nargs="+", help="Target residues for pocket constraints (format: 'A:123'). Optional.")
     parser.add_argument("--boltz_reward_cache_path", type=str, help="Path to reward cache database (default: {result_dir}/{time}/boltz_reward_cache.db).")
     
@@ -397,6 +398,8 @@ if __name__ == "__main__":
         config.task.boltz.cache_dir = param.boltz.cache_dir
     if OmegaConf.select(param, "boltz.use_msa_server", default=None) is not None:
         config.task.boltz.use_msa_server = param.boltz.use_msa_server
+    if OmegaConf.select(param, "boltz.worker", default=None) is not None:
+        config.task.boltz.worker = param.boltz.worker
     if OmegaConf.select(param, "boltz.target_residues", default=None) is not None:
         config.task.boltz.target_residues = param.boltz.target_residues
     if OmegaConf.select(param, "boltz.reward_cache_path", default=None) is not None:
