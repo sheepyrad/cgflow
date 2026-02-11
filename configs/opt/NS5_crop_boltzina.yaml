@@ -10,7 +10,7 @@ subsampling_ratio: 0.1 # Memory-variance trade-off
 protein_path: ./data/examples/NS5_crop.pdb
 center: null # search box center (will be calculated from target_residues)
 ref_ligand_path: ./data/examples/NS5_crop_ligand.mol2 # for validation docking
-size: [20, 20, 20] # search box size (will be calculated from target_residues)
+size: [16, 16, 16] 
 
 # opt
 num_steps: 2000
