@@ -1,4 +1,7 @@
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
+import threading
 from pathlib import Path
 import json
 import subprocess
@@ -43,6 +46,11 @@ class UniDockBoltzTask(BaseDockingTask):
         self.boltz_cache_dir = getattr(cfg.task.boltz, "cache_dir", "~/project/boltz_cache")
         self.boltz_use_msa_server = getattr(cfg.task.boltz, "use_msa_server", False)
         self.boltz_target_residues = getattr(cfg.task.boltz, "target_residues", None)
+        self.boltz_worker = int(getattr(cfg.task.boltz, "worker", 1))
+        if self.boltz_worker < 1:
+            raise ValueError(f"boltz.worker must be >= 1, got {self.boltz_worker}")
+        self._cache_worker_idx_by_thread: dict[int, int] = {}
+        self._cache_worker_idx_lock = threading.Lock()
         
         # Initialize reward cache
         cache_path = getattr(cfg.task.boltz, "reward_cache_path", None)
@@ -125,6 +133,76 @@ class UniDockBoltzTask(BaseDockingTask):
         else:
             raise NotImplementedError("Local optimization not implemented for UniDockBoltzTask")
 
+    @staticmethod
+    def _empty_boltz_result() -> dict[str, float]:
+        return {
+            "affinity_ensemble": 0.0,
+            "probability_ensemble": 0.0,
+            "affinity_model1": 0.0,
+            "probability_model1": 0.0,
+            "affinity_model2": 0.0,
+            "probability_model2": 0.0,
+        }
+
+    def _evaluate_uncached_smiles(
+        self,
+        smiles: str,
+        mol_idx: int,
+        batch_output_dir: Path,
+    ) -> tuple[str, float, dict[str, float], tuple[str, float, str]]:
+        """Evaluate one uncached SMILES and return score/result/cache-entry tuple."""
+        # Check Lilly filter FIRST (before expensive Boltz calculation)
+        try:
+            lily_mask = mc.functional.lilly_demerit_filter(
+                mols=[Chem.MolFromSmiles(smiles)],
+                n_jobs=-1,
+                progress=False,
+                return_idx=False,
+            )
+            assert len(lily_mask.shape) == 1, "Lilly mask should be a 1D array"
+            assert lily_mask.shape[0] == 1, "Lilly mask should have only one element"
+            lily_mask = float(lily_mask[0])
+            assert lily_mask == 0.0 or lily_mask == 1.0, "Lilly mask should be 0.0 or 1.0"
+        except Exception as e:
+            print(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
+            lily_mask = 0.0
+
+        if lily_mask == 0.0:
+            result = self._empty_boltz_result()
+            boltz_score = 0.0
+            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result))
+
+        try:
+            # Create temporary directory for this molecule
+            mol_temp_dir = batch_output_dir / f"mol_{mol_idx}"
+            mol_temp_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create YAML input file for Boltz-2
+            query_name = f"mol_{mol_idx}"
+            yaml_input_path = mol_temp_dir / f"{query_name}.yaml"
+            self._prepare_boltz_yaml(smiles, yaml_input_path)
+
+            # Run Boltz-2 prediction
+            boltz_output_dir = mol_temp_dir / "boltz_output"
+            self._run_boltz_prediction(yaml_input_path, boltz_output_dir)
+
+            # Extract affinity scores
+            result = self._extract_boltz_results(boltz_output_dir, query_name)
+            if result is None:
+                result = self._empty_boltz_result()
+                boltz_score = 0.0
+            else:
+                affinity_value1 = result.get("affinity_model1", 0.0)
+                affinity_prob1 = result.get("probability_model1", 0.0)
+                normalized_aff = max(0.0, (affinity_value1 * -1 + 2.0) / 4.0)
+                boltz_score = float(normalized_aff * affinity_prob1 * lily_mask)
+
+            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result))
+        except Exception as e:
+            print(f"Error in Boltz co-folding for molecule {mol_idx} (SMILES: {smiles}): {e}")
+            result = self._empty_boltz_result()
+            return smiles, 0.0, result, (smiles, 0.0, json.dumps(result))
+
     def run_cofold_with_boltz(self, mols: list[Chem.Mol]) -> list[float]:
         """Co-fold ligand and protein using Boltz-2 for each molecule."""
         # Initialize arrays for all molecules
@@ -138,8 +216,6 @@ class UniDockBoltzTask(BaseDockingTask):
         batch_output_dir.mkdir(parents=True, exist_ok=True)
         
         # First, get SMILES for all molecules and check cache
-        valid_mols = []
-        valid_indices = []
         smiles_to_compute = []
         smiles_to_indices = {}  # Map SMILES to list of indices (in case of duplicates)
         
@@ -163,19 +239,10 @@ class UniDockBoltzTask(BaseDockingTask):
                 if smiles not in smiles_to_indices:
                     smiles_to_indices[smiles] = []
                 smiles_to_indices[smiles].append(mol_idx)
-                valid_mols.append(mol)
-                valid_indices.append(mol_idx)
                 smiles_to_compute.append(smiles)
             except Exception as e:
                 print(f"Error processing molecule {mol_idx}: {e}")
-                boltz_results_all[mol_idx] = {
-                    "affinity_ensemble": 0.0,
-                    "probability_ensemble": 0.0,
-                    "affinity_model1": 0.0,
-                    "probability_model1": 0.0,
-                    "affinity_model2": 0.0,
-                    "probability_model2": 0.0,
-                }
+                boltz_results_all[mol_idx] = self._empty_boltz_result()
                 smiles_list[mol_idx] = Chem.MolToSmiles(mol) if mol is not None else ""
         
         # Check cache for all unique SMILES
@@ -214,103 +281,53 @@ class UniDockBoltzTask(BaseDockingTask):
         
         # Process uncached molecules
         new_cache_entries = []
-        for smiles in uncached_smiles:
-            mol_idx = smiles_to_indices[smiles][0]  # Use first occurrence
-            mol = valid_mols[valid_indices.index(mol_idx)]
-            
-            # Check Lilly filter FIRST (before expensive Boltz calculation)
-            # Since Lilly is binary (0 or 1), if it fails, we can skip Boltz entirely
-            try:
-                lily_mask = mc.functional.lilly_demerit_filter(
-                    mols=[Chem.MolFromSmiles(smiles)], 
-                    n_jobs=-1, 
-                    progress=False, 
-                    return_idx=False
-                )
-                assert len(lily_mask.shape) == 1, "Lilly mask should be a 1D array"
-                assert lily_mask.shape[0] == 1, "Lilly mask should have only one element"
-                lily_mask = float(lily_mask[0])
-                assert lily_mask == 0.0 or lily_mask == 1.0, "Lilly mask should be 0.0 or 1.0"
-            except Exception as e:
-                print(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
-                lily_mask = 0.0
-            
-            # If Lilly filter fails, skip Boltz calculation and return 0.0
-            if lily_mask == 0.0:
-                result = {
-                    "affinity_ensemble": 0.0,
-                    "probability_ensemble": 0.0,
-                    "affinity_model1": 0.0,
-                    "probability_model1": 0.0,
-                    "affinity_model2": 0.0,
-                    "probability_model2": 0.0,
-                }
-                boltz_score = 0.0
-                results_dict[smiles] = (boltz_score, result)
-                # Still cache the result to avoid re-checking Lilly in future
-                info_str = json.dumps(result)
-                new_cache_entries.append((smiles, boltz_score, info_str))
-                continue
-            
-            # Lilly passed (lily_mask == 1.0), proceed with Boltz calculation
-            try:
-                # Create temporary directory for this molecule
-                mol_temp_dir = batch_output_dir / f"mol_{mol_idx}"
-                mol_temp_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Create YAML input file for Boltz-2
-                query_name = f"mol_{mol_idx}"
-                yaml_input_path = mol_temp_dir / f"{query_name}.yaml"
-                self._prepare_boltz_yaml(smiles, yaml_input_path)
-                
-                # Run Boltz-2 prediction
-                boltz_output_dir = mol_temp_dir / "boltz_output"
-                self._run_boltz_prediction(yaml_input_path, boltz_output_dir)
-                
-                # Extract affinity scores
-                result = self._extract_boltz_results(boltz_output_dir, query_name)
-                
-                if result is not None:
-                    # Calculate Boltz score matching synflownet-boltz formula
-                    affinity_value1 = result.get("affinity_model1", 0.0)
-                    affinity_prob1 = result.get("probability_model1", 0.0)
-                    normalized_aff = max(0.0, (affinity_value1 * -1 + 2.0) / 4.0)
-                    
-                    # Apply Lilly mask (already checked above, should be 1.0)
-                    boltz_score = float(normalized_aff * affinity_prob1 * lily_mask)
-                    
-                    results_dict[smiles] = (boltz_score, result)
-                    
-                    # Prepare cache entry
-                    info_str = json.dumps(result)
-                    new_cache_entries.append((smiles, boltz_score, info_str))
-                else:
-                    # Failed to extract results
-                    result = {
-                        "affinity_ensemble": 0.0,
-                        "probability_ensemble": 0.0,
-                        "affinity_model1": 0.0,
-                        "probability_model1": 0.0,
-                        "affinity_model2": 0.0,
-                        "probability_model2": 0.0,
+        if uncached_smiles:
+            worker_count = min(self.boltz_worker, len(uncached_smiles))
+            print(f"Running Boltz for {len(uncached_smiles)} uncached SMILES with {worker_count} worker(s)")
+            worker_results: dict[str, tuple[float, dict[str, float], tuple[str, float, str]]] = {}
+
+            if worker_count == 1:
+                for smiles in uncached_smiles:
+                    mol_idx = smiles_to_indices[smiles][0]  # Use first occurrence
+                    _, boltz_score, result, cache_entry = self._evaluate_uncached_smiles(
+                        smiles=smiles,
+                        mol_idx=mol_idx,
+                        batch_output_dir=batch_output_dir,
+                    )
+                    worker_results[smiles] = (boltz_score, result, cache_entry)
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    future_to_smiles = {
+                        executor.submit(
+                            self._evaluate_uncached_smiles,
+                            smiles,
+                            smiles_to_indices[smiles][0],  # Use first occurrence
+                            batch_output_dir,
+                        ): smiles
+                        for smiles in uncached_smiles
                     }
-                    results_dict[smiles] = (0.0, result)
-                    info_str = json.dumps(result)
-                    new_cache_entries.append((smiles, 0.0, info_str))
-                    
-            except Exception as e:
-                print(f"Error in Boltz co-folding for molecule {mol_idx} (SMILES: {smiles}): {e}")
-                result = {
-                    "affinity_ensemble": 0.0,
-                    "probability_ensemble": 0.0,
-                    "affinity_model1": 0.0,
-                    "probability_model1": 0.0,
-                    "affinity_model2": 0.0,
-                    "probability_model2": 0.0,
-                }
-                results_dict[smiles] = (0.0, result)
-                info_str = json.dumps(result)
-                new_cache_entries.append((smiles, 0.0, info_str))
+
+                    for future in as_completed(future_to_smiles):
+                        smiles = future_to_smiles[future]
+                        try:
+                            _, boltz_score, result, cache_entry = future.result()
+                        except Exception as e:
+                            print(f"Unhandled worker error for {smiles}: {e}")
+                            result = self._empty_boltz_result()
+                            boltz_score = 0.0
+                            cache_entry = (smiles, boltz_score, json.dumps(result))
+                        worker_results[smiles] = (boltz_score, result, cache_entry)
+
+            # Merge in FIFO order of uncached_smiles for deterministic assembly.
+            for smiles in uncached_smiles:
+                if smiles in worker_results:
+                    boltz_score, result, cache_entry = worker_results[smiles]
+                else:
+                    result = self._empty_boltz_result()
+                    boltz_score = 0.0
+                    cache_entry = (smiles, boltz_score, json.dumps(result))
+                results_dict[smiles] = (boltz_score, result)
+                new_cache_entries.append(cache_entry)
         
         # Store new entries in cache
         if new_cache_entries:
@@ -420,38 +437,59 @@ class UniDockBoltzTask(BaseDockingTask):
         output_dir.mkdir(parents=True, exist_ok=True)
         
         # Build boltz predict command
-        cmd = ["boltz", "predict", str(yaml_input_path), "--out_dir", str(output_dir), "--output_format", "pdb", "--use_potentials"]
-        
-        # Add cache directory if specified
-        if self.boltz_cache_dir:
-            cache_dir = Path(self.boltz_cache_dir).expanduser().resolve()
-            cmd.extend(["--cache", str(cache_dir)])
-        
-        # Add MSA server flag if requested
-        if self.boltz_use_msa_server:
-            cmd.append("--use_msa_server")
-        
+        cache_dir = self._get_worker_cache_dir()
+        max_attempts = 2
         try:
-            # Set environment variables for GPU memory management
-            import os
-            env_vars = os.environ.copy()
-            env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
-            
-            # Run boltz command directly (no conda wrapper)
-            result = subprocess.run(
-                cmd,
-                cwd=None,
-                check=True,
-                capture_output=True,
-                text=True,
-                env=env_vars,
-            )
-            if result.stdout:
-                print(f"Boltz-2 prediction stdout: {result.stdout[:500]}")  # Print first 500 chars
-        except subprocess.CalledProcessError as e:
-            error_msg = e.stderr if e.stderr else (e.stdout if hasattr(e, 'stdout') else str(e))
-            print(f"Boltz-2 prediction failed: {error_msg}")
-            raise
+            for attempt in range(1, max_attempts + 1):
+                cmd = [
+                    "boltz",
+                    "predict",
+                    str(yaml_input_path),
+                    "--out_dir",
+                    str(output_dir),
+                    "--output_format",
+                    "pdb",
+                    "--use_potentials",
+                ]
+
+                # Add cache directory if specified
+                if cache_dir is not None:
+                    cmd.extend(["--cache", str(cache_dir)])
+
+                # Add MSA server flag if requested
+                if self.boltz_use_msa_server:
+                    cmd.append("--use_msa_server")
+
+                try:
+                    # Set environment variables for GPU memory management
+                    import os
+                    env_vars = os.environ.copy()
+                    env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+
+                    # Run boltz command directly (no conda wrapper)
+                    result = subprocess.run(
+                        cmd,
+                        cwd=None,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        env=env_vars,
+                    )
+                    if result.stdout:
+                        print(f"Boltz-2 prediction stdout: {result.stdout[:500]}")  # Print first 500 chars
+                    break
+                except subprocess.CalledProcessError as e:
+                    error_msg = e.stderr if e.stderr else (e.stdout if hasattr(e, "stdout") else str(e))
+                    is_badzip = "BadZipFile" in error_msg
+                    if is_badzip and attempt < max_attempts and cache_dir is not None:
+                        # Corrupted npz in cache can happen when multiple boltz subprocesses write/read shared files.
+                        # Reset this worker-local cache and retry once.
+                        print(f"Boltz cache corruption detected in {cache_dir}. Rebuilding cache and retrying once.")
+                        shutil.rmtree(cache_dir, ignore_errors=True)
+                        cache_dir.mkdir(parents=True, exist_ok=True)
+                        continue
+                    print(f"Boltz-2 prediction failed: {error_msg}")
+                    raise
         finally:
             # Clean up GPU memory after prediction
             import gc
@@ -459,6 +497,27 @@ class UniDockBoltzTask(BaseDockingTask):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
+
+    def _get_worker_cache_dir(self) -> Path | None:
+        """Return a cache directory isolated per thread when using multiple boltz workers."""
+        if not self.boltz_cache_dir:
+            return None
+
+        base_cache_dir = Path(self.boltz_cache_dir).expanduser().resolve()
+        if self.boltz_worker <= 1:
+            base_cache_dir.mkdir(parents=True, exist_ok=True)
+            return base_cache_dir
+
+        thread_id = threading.get_ident()
+        with self._cache_worker_idx_lock:
+            worker_idx = self._cache_worker_idx_by_thread.get(thread_id)
+            if worker_idx is None:
+                worker_idx = len(self._cache_worker_idx_by_thread)
+                self._cache_worker_idx_by_thread[thread_id] = worker_idx
+
+        worker_cache_dir = base_cache_dir / f"worker_{worker_idx}"
+        worker_cache_dir.mkdir(parents=True, exist_ok=True)
+        return worker_cache_dir
     
     def _extract_boltz_results(self, boltz_output_dir: Path, query_name: str) -> dict | None:
         """Extract affinity results from Boltz-2 output.

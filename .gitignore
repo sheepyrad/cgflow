@@ -165,3 +165,5 @@ src/app/*
 data/*.sdf
 data/*.zip
 docking_pipeline/*
+
+*.tar.gz
