@@ -166,4 +166,16 @@ data/*.sdf
 data/*.zip
 docking_pipeline/*
 
+# Data
 *.tar.gz
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.bz2
+*.xz
+*.lzma
+*.tar.bz2
+*.tar.xz
+*.tar.lzma

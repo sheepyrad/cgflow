@@ -1,5 +1,7 @@
 from collections import OrderedDict
 from pathlib import Path
+import re
+import subprocess
 
 import numpy as np
 import torch
@@ -14,6 +16,134 @@ from synthflow.pocket_specific.trainer import RxnFlow3DTrainer_single
 from synthflow.utils import boltzina_integration, unidock
 
 from .docking import BaseDockingTask
+
+
+def validate_poses_with_posebusters(
+    docked_sdf_path: Path,
+    receptor_pdb_path: Path,
+    conda_env: str = "cgflow-env",
+) -> list[int]:
+    """
+    Validate docked poses using PoseBusters.
+    
+    Parameters
+    ----------
+    docked_sdf_path : Path
+        Path to SDF file containing docked molecules
+    receptor_pdb_path : Path
+        Path to receptor PDB file (without chain B)
+    conda_env : str
+        Conda environment name where PoseBusters is installed
+        
+    Returns
+    -------
+    list[int]
+        List of molecule indices (0-based) that passed all PoseBusters checks.
+        Molecules that don't pass all checks are filtered out.
+    """
+    if not docked_sdf_path.exists():
+        return []
+    if not receptor_pdb_path.exists():
+        print(f"Warning: Receptor PDB not found: {receptor_pdb_path}, skipping PoseBusters validation")
+        return []
+    
+    try:
+        from synthflow.utils.conda_env import run_in_conda_env
+        
+        # Run PoseBusters command
+        bust_cmd = [
+            "bust",
+            str(docked_sdf_path.resolve()),
+            "-p", str(receptor_pdb_path.resolve()),
+            "--outfmt", "short",
+        ]
+        
+        result = run_in_conda_env(
+            bust_cmd,
+            conda_env=conda_env,
+            cwd=docked_sdf_path.parent,
+            check=False,  # Don't raise on error - we'll parse output
+            capture_output=True,
+            text=True,
+        )
+        
+        # Parse output to find molecules that passed all checks
+        # Output format: "oracle1_dock.sdf  0  passes (22 / 22)"
+        # We need molecules where passes (X / Y) has X == Y
+        passing_indices = []
+        
+        if result.stdout:
+            for line in result.stdout.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Match pattern: "oracle1_dock.sdf  <index>  passes (X / Y)"
+                # or "<path>  <index>  passes (X / Y)"
+                match = re.search(r'(\d+)\s+passes\s+\((\d+)\s+/\s+(\d+)\)', line)
+                if match:
+                    mol_idx = int(match.group(1))
+                    passed_checks = int(match.group(2))
+                    total_checks = int(match.group(3))
+                    
+                    # Only include molecules that passed all checks
+                    if passed_checks == total_checks:
+                        passing_indices.append(mol_idx)
+        
+        # Also check stderr for warnings/errors
+        if result.stderr:
+            print(f"PoseBusters stderr: {result.stderr}")
+        
+        if result.returncode != 0:
+            print(f"Warning: PoseBusters returned non-zero exit code {result.returncode}")
+            if result.stderr:
+                print(f"PoseBusters stderr: {result.stderr}")
+        
+        total_molecules = len(passing_indices) + max(0, len([l for l in result.stdout.split("\n") if "passes" in l]) - len(passing_indices)) if result.stdout else len(passing_indices)
+        print(f"PoseBusters validation: {len(passing_indices)}/{total_molecules} molecules passed all checks")
+        return sorted(passing_indices)
+        
+    except ImportError:
+        # If conda_env utility is not available, try running directly
+        print("Warning: conda_env utility not available, trying direct PoseBusters call")
+        try:
+            result = subprocess.run(
+                ["bust", str(docked_sdf_path.resolve()), "-p", str(receptor_pdb_path.resolve()), "--outfmt", "short"],
+                cwd=docked_sdf_path.parent,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            
+            passing_indices = []
+            if result.stdout:
+                for line in result.stdout.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    match = re.search(r'(\d+)\s+passes\s+\((\d+)\s+/\s+(\d+)\)', line)
+                    if match:
+                        mol_idx = int(match.group(1))
+                        passed_checks = int(match.group(2))
+                        total_checks = int(match.group(3))
+                        if passed_checks == total_checks:
+                            passing_indices.append(mol_idx)
+            
+            if result.returncode != 0:
+                print(f"Warning: PoseBusters returned non-zero exit code {result.returncode}")
+            
+            total_molecules = len([l for l in result.stdout.split("\n") if "passes" in l]) if result.stdout else len(passing_indices)
+            print(f"PoseBusters validation: {len(passing_indices)}/{total_molecules} molecules passed all checks")
+            return sorted(passing_indices)
+        except FileNotFoundError:
+            print("Warning: PoseBusters ('bust' command) not found. Skipping validation.")
+            return None  # Return None to indicate validation should be skipped
+        except Exception as e:
+            print(f"Warning: Error running PoseBusters: {e}. Skipping validation.")
+            return None  # Return None to indicate validation should be skipped
+    except Exception as e:
+        print(f"Warning: Error running PoseBusters validation: {e}. Skipping validation.")
+        return None  # Return None to indicate validation should be skipped
 
 
 class UniDockBoltzinaTask(BaseDockingTask):
@@ -62,17 +192,95 @@ class UniDockBoltzinaTask(BaseDockingTask):
                 docked_mols.append(docked_mol)
 
         # Save docked structures
+        # IMPORTANT: Track mapping from SDF position to original index
+        # because we skip None molecules when writing SDF
         output_result_path = self.save_dir / f"oracle{self.oracle_idx}_dock.sdf"
+        sdf_idx_to_original_idx = {}  # Maps SDF file position to original docked_mols index
+        sdf_position = 0
+        
         with Chem.SDWriter(str(output_result_path)) as w:
-            for docked_mol in docked_mols:
+            for original_idx, docked_mol in enumerate(docked_mols):
                 if docked_mol is not None:
                     w.write(docked_mol)
+                    sdf_idx_to_original_idx[sdf_position] = original_idx
+                    sdf_position += 1
+
+        # Step 1.5: Validate docked poses with PoseBusters
+        # Only validate if we have valid docked molecules
+        num_valid_docked = len([m for m in docked_mols if m is not None])
+        passing_sdf_indices = []  # PoseBusters returns SDF file indices
+        
+        if num_valid_docked > 0:
+            # Create receptor_no_B.pdb if it doesn't exist
+            boltzina_output_dir = self.boltzina_output_dir / f"oracle{self.oracle_idx}"
+            boltzina_output_dir.mkdir(parents=True, exist_ok=True)
+            receptor_no_b_path = boltzina_output_dir / "receptor_no_B.pdb"
+            
+            # Create receptor_no_B.pdb by removing chain B from receptor
+            if not receptor_no_b_path.exists():
+                boltzina_integration._remove_chain_b_from_receptor(
+                    self.boltzina_receptor_pdb,
+                    receptor_no_b_path
+                )
+            
+            # Run PoseBusters validation (returns SDF file indices)
+            passing_sdf_indices = validate_poses_with_posebusters(
+                docked_sdf_path=output_result_path,
+                receptor_pdb_path=receptor_no_b_path,
+                conda_env="cgflow-env",
+            )
+        else:
+            print("No valid docked molecules to validate with PoseBusters")
+        
+        # Convert SDF indices to original indices
+        # PoseBusters reports indices based on SDF file position (0, 1, 2, ...)
+        # but we need to map them back to original docked_mols indices
+        passing_original_indices = []
+        if passing_sdf_indices is not None:
+            for sdf_idx in passing_sdf_indices:
+                if sdf_idx in sdf_idx_to_original_idx:
+                    passing_original_indices.append(sdf_idx_to_original_idx[sdf_idx])
+                else:
+                    print(f"Warning: PoseBusters reported index {sdf_idx} but it's not in SDF mapping")
+        
+        # Filter docked_mols to only include passing molecules for scoring
+        # If PoseBusters validation failed (returned None), skip filtering
+        if passing_sdf_indices is None:
+            # PoseBusters validation failed - skip filtering and score all molecules
+            print("PoseBusters validation failed - scoring all docked molecules")
+            filtered_docked_mols_for_scoring = []
+            original_to_filtered_idx = {}
+            for i, docked_mol in enumerate(docked_mols):
+                if docked_mol is not None:
+                    original_to_filtered_idx[i] = len(filtered_docked_mols_for_scoring)
+                    filtered_docked_mols_for_scoring.append(docked_mol)
+        else:
+            # Create a set for fast lookup (using original indices now)
+            passing_set = set(passing_original_indices)
+            
+            # Create filtered list for scoring (only molecules that passed PoseBusters)
+            filtered_docked_mols_for_scoring = []
+            original_to_filtered_idx = {}  # Map original index to filtered index
+            
+            for i, docked_mol in enumerate(docked_mols):
+                if docked_mol is not None and i in passing_set:
+                    original_to_filtered_idx[i] = len(filtered_docked_mols_for_scoring)
+                    filtered_docked_mols_for_scoring.append(docked_mol)
+                # Skip molecules that failed PoseBusters validation
+        
+        num_passed = len(filtered_docked_mols_for_scoring)
+        num_filtered = num_valid_docked - num_passed
+        if num_valid_docked > 0:
+            print(f"PoseBusters validation: {num_passed}/{num_valid_docked} molecules passed all checks ({num_filtered} filtered out)")
+        else:
+            print("PoseBusters validation: No molecules to validate")
 
         # Step 2: Score using Boltzina (get all scores for database)
+        # Only score molecules that passed PoseBusters validation
         try:
-            # Get all boltz scores for database logging
-            boltz_results_all = boltzina_integration.boltzina_scoring(
-                docked_mols=docked_mols,
+            # Get all boltz scores for database logging (only for passing molecules)
+            boltz_results_all_filtered = boltzina_integration.boltzina_scoring(
+                docked_mols=filtered_docked_mols_for_scoring,
                 receptor_pdb=self.boltzina_receptor_pdb,
                 work_dir=self.boltzina_work_dir,
                 output_dir=self.boltzina_output_dir / f"oracle{self.oracle_idx}",
@@ -83,26 +291,55 @@ class UniDockBoltzinaTask(BaseDockingTask):
                 return_all_scores=True,  # Get all scores for database
             )
             
-            # Store for database logging
+            # Map results back to original molecule indices
+            # Create full-length lists with zero scores for filtered molecules
+            boltz_results_all = []
+            boltz_scores = []
+            
+            for i, docked_mol in enumerate(docked_mols):
+                if docked_mol is None:
+                    # Original molecule was None (docking failed)
+                    boltz_results_all.append({
+                        "affinity_ensemble": 0.0,
+                        "probability_ensemble": 0.0,
+                        "affinity_model1": 0.0,
+                        "probability_model1": 0.0,
+                        "affinity_model2": 0.0,
+                        "probability_model2": 0.0,
+                    })
+                    boltz_scores.append(0.0)
+                elif i in original_to_filtered_idx:
+                    # Molecule passed PoseBusters - use actual score
+                    filtered_idx = original_to_filtered_idx[i]
+                    boltz_result = boltz_results_all_filtered[filtered_idx]
+                    boltz_results_all.append(boltz_result)
+                    
+                    # Calculate Boltz score
+                    if isinstance(boltz_result, dict):
+                        affinity_value1 = boltz_result.get("affinity_model1", 0.0)
+                        affinity_prob1 = boltz_result.get("probability_model1", 0.0)
+                    else:
+                        affinity_value1, affinity_prob1 = boltz_result
+                    
+                    normalized_aff = max(((-affinity_value1 + 2) / 4), 0.0)
+                    boltz_score = normalized_aff * affinity_prob1
+                    boltz_scores.append(boltz_score)
+                else:
+                    # Molecule failed PoseBusters validation - return zero score
+                    boltz_results_all.append({
+                        "affinity_ensemble": 0.0,
+                        "probability_ensemble": 0.0,
+                        "affinity_model1": 0.0,
+                        "probability_model1": 0.0,
+                        "affinity_model2": 0.0,
+                        "probability_model2": 0.0,
+                    })
+                    boltz_scores.append(0.0)
+            
+            # Store for database logging (full length lists)
             self.batch_docking_scores = docking_scores
             self.batch_boltz_scores = boltz_results_all
             self.batch_smiles = [Chem.MolToSmiles(mol) if mol is not None else "" for mol in mols]
-
-            # Step 3: Calculate Boltz score (for reward calculation)
-            boltz_scores = []
-            for boltz_result in boltz_results_all:
-                if isinstance(boltz_result, dict):
-                    # Use model1 scores for backward compatibility
-                    affinity_value1 = boltz_result.get("affinity_model1", 0.0)
-                    affinity_prob1 = boltz_result.get("probability_model1", 0.0)
-                else:
-                    # Fallback for old format
-                    affinity_value1, affinity_prob1 = boltz_result
-                
-                # Boltz score formula: max(((-affinity_pred_value1+2)/4),0) * affinity_probability_binary1
-                normalized_aff = max(((-affinity_value1 + 2) / 4), 0.0)
-                boltz_score = normalized_aff * affinity_prob1
-                boltz_scores.append(boltz_score)
 
             return boltz_scores
 

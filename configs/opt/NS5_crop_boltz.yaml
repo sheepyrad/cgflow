@@ -1,5 +1,5 @@
 # save dir
-result_dir: "./result/opt/unidock_boltz/NS5"
+result_dir: "/media/data/conrad_hku/3DSynthFlow_boltz/result/opt/unidock_boltz/NS5"
 
 # environment
 env_dir: ./data/envs/enamine_stock_new
@@ -13,8 +13,8 @@ ref_ligand_path: ./data/examples/NS5_crop_ligand.mol2  # Optional: Used to calcu
 size: [16, 16, 16]  # Size for pocket extraction
 
 # opt
-num_steps: 2000
-num_sampling_per_step: 32
+num_steps: 1000
+num_sampling_per_step: 64
 temperature: [1, 64] # uniform(1, 64)
 seed: 481
 
