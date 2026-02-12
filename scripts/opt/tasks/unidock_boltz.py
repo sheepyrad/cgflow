@@ -4,6 +4,8 @@ import shutil
 import threading
 from pathlib import Path
 import json
+import os
+import signal
 import subprocess
 import yaml
 
@@ -248,6 +250,8 @@ class UniDockBoltzTask(BaseDockingTask):
         # Check cache for all unique SMILES
         cached_results = self.reward_cache.get_hits(smiles_to_compute)
         uncached_smiles = [s for s in smiles_to_compute if s not in cached_results]
+        # Keep FIFO order but avoid duplicate Boltz jobs for repeated SMILES in a batch.
+        uncached_smiles = list(dict.fromkeys(uncached_smiles))
         
         print(f"Cache hit rate: {len(cached_results)}/{len(smiles_to_compute)} ({100*len(cached_results)/len(smiles_to_compute):.1f}%)")
         
@@ -464,24 +468,30 @@ class UniDockBoltzTask(BaseDockingTask):
 
                 try:
                     # Set environment variables for GPU memory management
-                    import os
                     env_vars = os.environ.copy()
                     env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
 
-                    # Run boltz command directly (no conda wrapper)
-                    result = subprocess.run(
-                        cmd,
-                        cwd=None,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                        env=env_vars,
-                    )
-                    if result.stdout:
-                        print(f"Boltz-2 prediction stdout: {result.stdout[:500]}")  # Print first 500 chars
-                    break
-                except subprocess.CalledProcessError as e:
-                    error_msg = e.stderr if e.stderr else (e.stdout if hasattr(e, "stdout") else str(e))
+                    # Stream all boltz logs to disk to avoid storing large progress-bar output in memory.
+                    log_path = output_dir / "boltz_predict.log"
+                    with open(log_path, "a", encoding="utf-8") as log_fd:
+                        log_fd.write(f"\n=== boltz attempt {attempt}/{max_attempts} ===\n")
+                        log_fd.write("cmd: " + " ".join(cmd) + "\n")
+                        proc = subprocess.Popen(
+                            cmd,
+                            cwd=None,
+                            stdout=log_fd,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            env=env_vars,
+                            start_new_session=True,
+                        )
+                        return_code = proc.wait()
+
+                    if return_code == 0:
+                        print(f"Boltz-2 prediction completed: {log_path}")
+                        break
+
+                    error_msg = self._read_log_tail(log_path, max_chars=4000)
                     is_badzip = "BadZipFile" in error_msg
                     if is_badzip and attempt < max_attempts and cache_dir is not None:
                         # Corrupted npz in cache can happen when multiple boltz subprocesses write/read shared files.
@@ -490,7 +500,16 @@ class UniDockBoltzTask(BaseDockingTask):
                         shutil.rmtree(cache_dir, ignore_errors=True)
                         cache_dir.mkdir(parents=True, exist_ok=True)
                         continue
-                    print(f"Boltz-2 prediction failed: {error_msg}")
+                    print(f"Boltz-2 prediction failed (see {log_path}):\n{error_msg}")
+                    raise subprocess.CalledProcessError(return_code, cmd)
+                except Exception:
+                    # If interrupted/failed mid-run, terminate the entire process group to prevent orphan workers.
+                    if "proc" in locals() and proc.poll() is None:
+                        try:
+                            os.killpg(proc.pid, signal.SIGTERM)
+                            proc.wait(timeout=10)
+                        except Exception:
+                            pass
                     raise
         finally:
             # Clean up GPU memory after prediction
@@ -499,6 +518,17 @@ class UniDockBoltzTask(BaseDockingTask):
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
+
+    @staticmethod
+    def _read_log_tail(log_path: Path, max_chars: int = 4000) -> str:
+        """Read tail of log file for concise error reporting/retry checks."""
+        try:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            if len(text) <= max_chars:
+                return text
+            return text[-max_chars:]
+        except Exception:
+            return ""
 
     def _get_worker_cache_dir(self) -> Path | None:
         """Return a cache directory isolated per thread when using multiple boltz workers."""
