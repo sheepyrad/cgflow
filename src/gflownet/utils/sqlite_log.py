@@ -121,7 +121,7 @@ class BoltzinaSQLiteLogHook:
     Separate database hook for storing SMILES, docking scores, and all boltz scores.
     Creates a separate database file:
     - boltzina_scores_{worker_id}.db for UniDockBoltzinaTask
-    - boltz_scores_{worker_id}.db for UniDockBoltzTask
+    - boltz_scores_{worker_id}.db for BoltzTask
     """
     def __init__(self, log_dir, task) -> None:
         self.log = None  # Only initialized in __call__, which will occur inside the worker
@@ -135,14 +135,14 @@ class BoltzinaSQLiteLogHook:
             # UniDockBoltzinaTask or UniDockBoltzinaMOOTask
             self.db_prefix = "boltzina_scores"
         elif "Boltz" in task_class_name:
-            # UniDockBoltzTask or UniDockBoltzMOOTask
+            # BoltzTask or BoltzMOOTask
             self.db_prefix = "boltz_scores"
         else:
             # Default to boltzina for backward compatibility
             self.db_prefix = "boltzina_scores"
 
     def __call__(self, trajs, rewards, obj_props, cond_info):
-        # Only log if task has batch_smiles (i.e., it's a UniDockBoltzinaTask or UniDockBoltzTask)
+        # Only log if task has batch_smiles (i.e., it's a UniDockBoltzinaTask or BoltzTask)
         if not hasattr(self.task, "batch_smiles") or not self.task.batch_smiles:
             return {}
         

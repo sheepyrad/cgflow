@@ -227,7 +227,7 @@ def run_boltz_predict(input_yaml: Path, output_dir: Path, query_name: Optional[s
         # Try to find affinity JSON file
         affinity_file = None
         
-        # Try multiple possible output structures (similar to UniDockBoltzTask._extract_boltz_results)
+        # Try multiple possible output structures (similar to BoltzTask._extract_boltz_results)
         possible_paths = []
         
         # Structure 1: <out_dir>/predictions/<query_name>/affinity_<query_name>.json

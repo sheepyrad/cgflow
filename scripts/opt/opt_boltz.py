@@ -43,13 +43,13 @@ def parse_args() -> DictConfig:
     )
     parser.add_argument("--seed", type=int, help="Random seed for reproducibility.")
 
-    # docking (not used for co-folding, but kept for compatibility)
-    parser.add_argument("--protein_path", type=str, help="Path to the protein structure file (not used in co-folding).")
-    parser.add_argument("--center", type=float, nargs=3, help="Center coordinates (x y z) for search box (not used in co-folding).")
+    # pocket context for molecule generation
+    parser.add_argument("--protein_path", type=str, help="Path to the protein structure file (used for pocket context setup).")
+    parser.add_argument("--center", type=float, nargs=3, help="Center coordinates (x y z) for search box (used for pocket context setup).")
     parser.add_argument(
-        "--ref_ligand_path", type=str, help="Path to the reference ligand file (not used in co-folding)."
+        "--ref_ligand_path", type=str, help="Path to the reference ligand file (used for pocket context setup)."
     )
-    parser.add_argument("--size", type=float, nargs=3, help="Size (x y z) of the search box (not used in co-folding).")
+    parser.add_argument("--size", type=float, nargs=3, help="Size (x y z) of the search box (used for pocket context setup).")
 
     # pose prediction
     parser.add_argument("--pose_model", type=str, help="Path to the pose prediction model checkpoint.")
@@ -272,13 +272,13 @@ def backup_oracles_if_needed(log_dir: Path, resume_oracle_idx: int, scanned_max:
 
 
 if __name__ == "__main__":
-    from tasks.unidock_boltz import UniDockBoltzMOOTrainer
+    from tasks.boltz import BoltzMOOTrainer
 
     param = parse_args()
 
     config = init_empty(Config())
 
-    config.desc = "Multi objective optimization for UniDock Boltz co-folding"
+    config.desc = "Multi objective optimization for Boltz co-folding"
     # Default objectives - can be overridden in config file
     # QED is now optional, lilly filter is applied to boltz reward calculation
     # Set default objectives if not specified in config
@@ -405,7 +405,7 @@ if __name__ == "__main__":
     if OmegaConf.select(param, "boltz.reward_cache_path", default=None) is not None:
         config.task.boltz.reward_cache_path = str(Path(param.boltz.reward_cache_path).resolve())
 
-    # Docking config (needed for pocket context setup - defines where to generate molecules)
+    # Pocket-context config (defines where to generate molecules)
     # We need a valid protein_path and either center or ref_ligand_path
     if not param.protein_path:
         raise ValueError("protein_path is required in config file for pocket context setup (defines where to generate molecules)")
@@ -443,15 +443,25 @@ if __name__ == "__main__":
     config.replay.num_from_replay = config.algo.num_from_policy  # buffer sampling size
 
     # Set module-level resume flags before instantiation
-    import tasks.unidock_boltz as unidock_boltz_module
-    unidock_boltz_module._RESUME_MODE = resume_mode
-    unidock_boltz_module._RESUME_ORACLE_IDX = resume_oracle_idx_value
+    import tasks.boltz as boltz_module
+    boltz_module._RESUME_MODE = resume_mode
+    boltz_module._RESUME_ORACLE_IDX = resume_oracle_idx_value
     
-    # Initialize trainer (no database restoration needed - we never deleted anything!)
-    trainer = UniDockBoltzMOOTrainer(config)
+    # Initialize trainer
+    trainer = BoltzMOOTrainer(config)
     
     print(f"Using Boltz co-folding with base YAML: {boltz_base_yaml}")
     print(f"Each sampled ligand will be co-folded with the protein using Boltz-2")
     
-    trainer.run()
+    try:
+        trainer.run()
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt received. Stopping training and cleaning up Boltz subprocesses...")
+        task = getattr(trainer, "task", None)
+        if task is not None and hasattr(task, "_terminate_active_boltz_processes"):
+            try:
+                task._terminate_active_boltz_processes()
+            except Exception as e:
+                print(f"Warning: cleanup of Boltz subprocesses failed: {e}")
+        raise
 

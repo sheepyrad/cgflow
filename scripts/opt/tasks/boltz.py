@@ -2,6 +2,7 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import shutil
 import threading
+import time
 from pathlib import Path
 import json
 import os
@@ -25,12 +26,12 @@ from synthflow.utils.boltz_reward_cache import BoltzRewardCache
 from .docking import BaseDockingTask
 
 
-# Module-level variables for resume mode (set by opt_unidock_boltz.py before trainer instantiation)
+# Module-level variables for resume mode (set by opt_boltz.py before trainer instantiation)
 _RESUME_MODE: bool = False
 _RESUME_ORACLE_IDX: int | None = None
 
 
-class UniDockBoltzTask(BaseDockingTask):
+class BoltzTask(BaseDockingTask):
     """Task for co-folding ligand and protein using Boltz-2."""
     
     def __init__(self, cfg: Config):
@@ -40,11 +41,13 @@ class UniDockBoltzTask(BaseDockingTask):
         self.boltz_msa_path = getattr(cfg.task.boltz, "msa_path", None)
         self.boltz_output_dir = Path(cfg.log_dir) / "boltz_cofold"
         self.boltz_output_dir.mkdir(parents=True, exist_ok=True)
+        self.boltz_metrics_log_path = Path(cfg.log_dir) / "boltz_metrics.log"
+        self.boltz_metrics_log_path.parent.mkdir(parents=True, exist_ok=True)
         
         # Set oracle_idx from module-level variable if resuming
         if _RESUME_ORACLE_IDX is not None:
             self.oracle_idx = _RESUME_ORACLE_IDX
-            print(f"Resuming with oracle_idx starting at: {self.oracle_idx}")
+            self._boltz_log(f"Resuming with oracle_idx starting at: {self.oracle_idx}")
         self.boltz_cache_dir = getattr(cfg.task.boltz, "cache_dir", "~/project/boltz_cache")
         self.boltz_use_msa_server = getattr(cfg.task.boltz, "use_msa_server", False)
         self.boltz_target_residues = getattr(cfg.task.boltz, "target_residues", None)
@@ -53,6 +56,12 @@ class UniDockBoltzTask(BaseDockingTask):
             raise ValueError(f"boltz.worker must be >= 1, got {self.boltz_worker}")
         self._cache_worker_idx_by_thread: dict[int, int] = {}
         self._cache_worker_idx_lock = threading.Lock()
+        self._active_boltz_procs: dict[int, subprocess.Popen] = {}
+        self._active_boltz_procs_lock = threading.Lock()
+        self._boltz_dispatch_lock = threading.Lock()
+        self._boltz_min_free_gpu_mb = int(getattr(cfg.task.boltz, "min_free_gpu_mb", 500))
+        self._boltz_gpu_wait_interval_s = float(getattr(cfg.task.boltz, "gpu_wait_interval_s", 2.0))
+        self._boltz_launch_stagger_s = float(getattr(cfg.task.boltz, "launch_stagger_s", 3.0))
         
         # Initialize reward cache
         cache_path = getattr(cfg.task.boltz, "reward_cache_path", None)
@@ -61,8 +70,8 @@ class UniDockBoltzTask(BaseDockingTask):
         else:
             cache_path = Path(cache_path)
         self.reward_cache = BoltzRewardCache(str(cache_path))
-        print(f"Initialized Boltz reward cache at: {cache_path}")
-        print(f"Cache size: {self.reward_cache.get_db_size(fast=True):,} entries")
+        self._boltz_log(f"Initialized Boltz reward cache at: {cache_path}")
+        self._boltz_log(f"Cache size: {self.reward_cache.get_db_size(fast=True):,} entries")
         
         # Storage for database logging
         self.batch_docking_scores = []  # Empty list - no docking in co-folding
@@ -102,6 +111,17 @@ class UniDockBoltzTask(BaseDockingTask):
             if restored:
                 self.topn_affinity = restored
 
+    def _boltz_log(self, message: str) -> None:
+        """Print Boltz-related logs and append them to a dedicated log file."""
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{ts}] {message}"
+        print(line)
+        try:
+            with open(self.boltz_metrics_log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            print(f"Warning: failed to write boltz metrics log {self.boltz_metrics_log_path}: {e}")
+
     def restore_topn_from_cache(self) -> OrderedDict[str, float] | None:
         """Load top N molecules from boltz_reward_cache.db on resume."""
         cache_path = Path(self.cfg.log_dir) / "boltz_reward_cache.db"
@@ -122,10 +142,10 @@ class UniDockBoltzTask(BaseDockingTask):
             conn.close()
             
             topn = OrderedDict((smiles, reward) for smiles, reward in results)
-            print(f"Restored {len(topn)} top molecules from reward cache")
+            self._boltz_log(f"Restored {len(topn)} top molecules from reward cache")
             return topn
         except Exception as e:
-            print(f"Warning: Failed to restore topn_affinity from cache: {e}")
+            self._boltz_log(f"Warning: Failed to restore topn_affinity from cache: {e}")
             return None
 
     def calc_affinities(self, mols: list[Chem.Mol]) -> list[float]:
@@ -133,7 +153,7 @@ class UniDockBoltzTask(BaseDockingTask):
         if self.redocking:
             return self.run_cofold_with_boltz(mols)
         else:
-            raise NotImplementedError("Local optimization not implemented for UniDockBoltzTask")
+            raise NotImplementedError("Local optimization not implemented for BoltzTask")
 
     @staticmethod
     def _empty_boltz_result() -> dict[str, float]:
@@ -151,8 +171,8 @@ class UniDockBoltzTask(BaseDockingTask):
         smiles: str,
         mol_idx: int,
         batch_output_dir: Path,
-    ) -> tuple[str, float, dict[str, float], tuple[str, float, str]]:
-        """Evaluate one uncached SMILES and return score/result/cache-entry tuple."""
+    ) -> tuple[str, float, dict[str, float], tuple[str, float, str], str]:
+        """Evaluate one uncached SMILES and return score/result/cache-entry/status tuple."""
         # Check Lilly filter FIRST (before expensive Boltz calculation)
         try:
             lily_mask = mc.functional.lilly_demerit_filter(
@@ -166,13 +186,14 @@ class UniDockBoltzTask(BaseDockingTask):
             lily_mask = float(lily_mask[0])
             assert lily_mask == 0.0 or lily_mask == 1.0, "Lilly mask should be 0.0 or 1.0"
         except Exception as e:
-            print(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
+            self._boltz_log(f"Warning: Failed to compute lilly filter for {smiles}: {e}")
             lily_mask = 0.0
 
         if lily_mask == 0.0:
             result = self._empty_boltz_result()
+            result["lilly_pass"] = 0.0
             boltz_score = 0.0
-            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result))
+            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result)), "lilly_fail"
 
         try:
             # Create temporary directory for this molecule
@@ -192,21 +213,29 @@ class UniDockBoltzTask(BaseDockingTask):
             result = self._extract_boltz_results(boltz_output_dir, query_name)
             if result is None:
                 result = self._empty_boltz_result()
+                result["lilly_pass"] = 1.0
                 boltz_score = 0.0
+                return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result)), "failed"
             else:
                 affinity_value1 = result.get("affinity_model1", 0.0)
                 affinity_prob1 = result.get("probability_model1", 0.0)
                 normalized_aff = max(0.0, (affinity_value1 * -1 + 2.0) / 4.0)
                 boltz_score = float(normalized_aff * affinity_prob1 * lily_mask)
+                result["lilly_pass"] = 1.0
 
-            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result))
+            return smiles, boltz_score, result, (smiles, boltz_score, json.dumps(result)), "success"
         except Exception as e:
-            print(f"Error in Boltz co-folding for molecule {mol_idx} (SMILES: {smiles}): {e}")
+            self._boltz_log(f"Error in Boltz co-folding for molecule {mol_idx} (SMILES: {smiles}): {e}")
             result = self._empty_boltz_result()
-            return smiles, 0.0, result, (smiles, 0.0, json.dumps(result))
+            result["lilly_pass"] = 1.0
+            return smiles, 0.0, result, (smiles, 0.0, json.dumps(result)), "error"
 
     def run_cofold_with_boltz(self, mols: list[Chem.Mol]) -> list[float]:
         """Co-fold ligand and protein using Boltz-2 for each molecule."""
+        total_generated = len(mols)
+        none_molecule_count = 0
+        smiles_parse_error_count = 0
+
         # Initialize arrays for all molecules
         boltz_scores = [0.0] * len(mols)
         boltz_results_all = [None] * len(mols)
@@ -223,6 +252,7 @@ class UniDockBoltzTask(BaseDockingTask):
         
         for mol_idx, mol in enumerate(mols):
             if mol is None:
+                none_molecule_count += 1
                 boltz_results_all[mol_idx] = {
                     "affinity_ensemble": 0.0,
                     "probability_ensemble": 0.0,
@@ -243,7 +273,8 @@ class UniDockBoltzTask(BaseDockingTask):
                 smiles_to_indices[smiles].append(mol_idx)
                 smiles_to_compute.append(smiles)
             except Exception as e:
-                print(f"Error processing molecule {mol_idx}: {e}")
+                self._boltz_log(f"Error processing molecule {mol_idx}: {e}")
+                smiles_parse_error_count += 1
                 boltz_results_all[mol_idx] = self._empty_boltz_result()
                 smiles_list[mol_idx] = Chem.MolToSmiles(mol) if mol is not None else ""
         
@@ -253,7 +284,11 @@ class UniDockBoltzTask(BaseDockingTask):
         # Keep FIFO order but avoid duplicate Boltz jobs for repeated SMILES in a batch.
         uncached_smiles = list(dict.fromkeys(uncached_smiles))
         
-        print(f"Cache hit rate: {len(cached_results)}/{len(smiles_to_compute)} ({100*len(cached_results)/len(smiles_to_compute):.1f}%)")
+        if len(smiles_to_compute) > 0:
+            cache_hit_rate = 100 * len(cached_results) / len(smiles_to_compute)
+            self._boltz_log(f"Cache hit rate: {len(cached_results)}/{len(smiles_to_compute)} ({cache_hit_rate:.1f}%)")
+        else:
+            self._boltz_log("Cache hit rate: 0/0 (0.0%)")
         
         # Initialize results arrays (will be filled in order)
         results_dict = {}  # smiles -> (score, result_dict)
@@ -280,29 +315,32 @@ class UniDockBoltzTask(BaseDockingTask):
                 }
                 results_dict[smiles] = (reward, result)
             except Exception as e:
-                print(f"Error parsing cached result for {smiles}: {e}")
+                self._boltz_log(f"Error parsing cached result for {smiles}: {e}")
                 # If parsing fails, treat as uncached
                 if smiles not in uncached_smiles:
                     uncached_smiles.append(smiles)
         
         # Process uncached molecules
         new_cache_entries = []
+        uncached_status_by_smiles: dict[str, str] = {}
         if uncached_smiles:
             worker_count = min(self.boltz_worker, len(uncached_smiles))
-            print(f"Running Boltz for {len(uncached_smiles)} uncached SMILES with {worker_count} worker(s)")
-            worker_results: dict[str, tuple[float, dict[str, float], tuple[str, float, str]]] = {}
+            self._boltz_log(f"Running Boltz for {len(uncached_smiles)} uncached SMILES with {worker_count} worker(s)")
+            worker_results: dict[str, tuple[float, dict[str, float], tuple[str, float, str], str]] = {}
 
             if worker_count == 1:
                 for smiles in uncached_smiles:
                     mol_idx = smiles_to_indices[smiles][0]  # Use first occurrence
-                    _, boltz_score, result, cache_entry = self._evaluate_uncached_smiles(
+                    _, boltz_score, result, cache_entry, status = self._evaluate_uncached_smiles(
                         smiles=smiles,
                         mol_idx=mol_idx,
                         batch_output_dir=batch_output_dir,
                     )
-                    worker_results[smiles] = (boltz_score, result, cache_entry)
+                    worker_results[smiles] = (boltz_score, result, cache_entry, status)
             else:
-                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                executor = ThreadPoolExecutor(max_workers=worker_count)
+                future_to_smiles = {}
+                try:
                     future_to_smiles = {
                         executor.submit(
                             self._evaluate_uncached_smiles,
@@ -316,32 +354,46 @@ class UniDockBoltzTask(BaseDockingTask):
                     for future in as_completed(future_to_smiles):
                         smiles = future_to_smiles[future]
                         try:
-                            _, boltz_score, result, cache_entry = future.result()
+                            _, boltz_score, result, cache_entry, status = future.result()
                         except Exception as e:
-                            print(f"Unhandled worker error for {smiles}: {e}")
+                            self._boltz_log(f"Unhandled worker error for {smiles}: {e}")
                             result = self._empty_boltz_result()
+                            result["lilly_pass"] = 1.0
                             boltz_score = 0.0
                             cache_entry = (smiles, boltz_score, json.dumps(result))
-                        worker_results[smiles] = (boltz_score, result, cache_entry)
+                            status = "error"
+                        worker_results[smiles] = (boltz_score, result, cache_entry, status)
+                except KeyboardInterrupt:
+                    self._boltz_log("KeyboardInterrupt received: terminating active Boltz subprocesses...")
+                    self._terminate_active_boltz_processes()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                finally:
+                    executor.shutdown(wait=True)
 
             # Merge in FIFO order of uncached_smiles for deterministic assembly.
             for smiles in uncached_smiles:
                 if smiles in worker_results:
-                    boltz_score, result, cache_entry = worker_results[smiles]
+                    boltz_score, result, cache_entry, status = worker_results[smiles]
                 else:
                     result = self._empty_boltz_result()
+                    result["lilly_pass"] = 1.0
                     boltz_score = 0.0
                     cache_entry = (smiles, boltz_score, json.dumps(result))
+                    status = "error"
                 results_dict[smiles] = (boltz_score, result)
                 new_cache_entries.append(cache_entry)
+                uncached_status_by_smiles[smiles] = status
         
         # Store new entries in cache
         if new_cache_entries:
             try:
                 self.reward_cache.insert_entries(new_cache_entries)
-                print(f"Cached {len(new_cache_entries)} new entries. Cache size: {self.reward_cache.get_db_size(fast=True):,}")
+                self._boltz_log(
+                    f"Cached {len(new_cache_entries)} new entries. Cache size: {self.reward_cache.get_db_size(fast=True):,}"
+                )
             except Exception as e:
-                print(f"Warning: Failed to update cache: {e}")
+                self._boltz_log(f"Warning: Failed to update cache: {e}")
         
         # Fill results arrays in original order
         for mol_idx, smiles in enumerate(smiles_list):
@@ -349,6 +401,22 @@ class UniDockBoltzTask(BaseDockingTask):
                 score, result = results_dict[smiles]
                 boltz_scores[mol_idx] = score
                 boltz_results_all[mol_idx] = result.copy()  # Make a copy to avoid reference issues
+
+        # Print per-iteration summary for easier runtime monitoring.
+        evaluated_this_iteration = len(uncached_smiles)
+        lilly_pass_count = sum(1 for status in uncached_status_by_smiles.values() if status != "lilly_fail")
+        failed_count = sum(1 for status in uncached_status_by_smiles.values() if status in {"failed", "error"})
+        success_count = sum(1 for status in uncached_status_by_smiles.values() if status == "success")
+        self._boltz_log(
+            "[Boltz Iteration Summary] "
+            f"generated={total_generated}, "
+            f"none={none_molecule_count}, "
+            f"smiles_parse_error={smiles_parse_error_count}, "
+            f"evaluated={evaluated_this_iteration}, "
+            f"lilly_pass={lilly_pass_count}, "
+            f"failed={failed_count}, "
+            f"success={success_count}"
+        )
         
         # Store for database logging
         self.batch_docking_scores = docking_scores
@@ -389,7 +457,7 @@ class UniDockBoltzTask(BaseDockingTask):
             if msa_path.exists():
                 yaml_dict["sequences"][0]["protein"]["msa"] = str(msa_path)
             else:
-                print(f"Warning: MSA file not found: {msa_path}")
+                self._boltz_log(f"Warning: MSA file not found: {msa_path}")
         
         # Add constraints if target_residues are provided
         if self.boltz_target_residues:
@@ -405,7 +473,7 @@ class UniDockBoltzTask(BaseDockingTask):
                     contacts.append([chain_id, int(res_id)])
                 else:
                     # If format is incorrect, skip with warning
-                    print(f"Warning: Invalid residue format '{residue_spec}', expected 'A:123' format. Skipping.")
+                    self._boltz_log(f"Warning: Invalid residue format '{residue_spec}', expected 'A:123' format. Skipping.")
             
             if contacts:
                 yaml_dict["constraints"] = [
@@ -471,8 +539,20 @@ class UniDockBoltzTask(BaseDockingTask):
                     env_vars = os.environ.copy()
                     env_vars.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
 
+                    # Wait for an available launch slot and enough free GPU memory.
+                    # This allows pipelined dispatch: as soon as one worker finishes, the next can launch.
+                    with self._boltz_dispatch_lock:
+                        self._wait_for_gpu_slot()
+                        if self._boltz_launch_stagger_s > 0:
+                            self._boltz_log(f"Launch stagger sleep: {self._boltz_launch_stagger_s:.1f}s")
+                            time.sleep(self._boltz_launch_stagger_s)
+
                     # Stream all boltz logs to disk to avoid storing large progress-bar output in memory.
                     log_path = output_dir / "boltz_predict.log"
+                    self._boltz_log(
+                        "Starting Boltz prediction "
+                        f"(attempt {attempt}/{max_attempts}) - log: {log_path}"
+                    )
                     with open(log_path, "a", encoding="utf-8") as log_fd:
                         log_fd.write(f"\n=== boltz attempt {attempt}/{max_attempts} ===\n")
                         log_fd.write("cmd: " + " ".join(cmd) + "\n")
@@ -485,22 +565,49 @@ class UniDockBoltzTask(BaseDockingTask):
                             env=env_vars,
                             start_new_session=True,
                         )
-                        return_code = proc.wait()
+                        self._register_active_boltz_proc(proc)
+                        try:
+                            return_code = proc.wait()
+                        finally:
+                            self._unregister_active_boltz_proc(proc)
 
                     if return_code == 0:
-                        print(f"Boltz-2 prediction completed: {log_path}")
+                        self._boltz_log(f"Boltz-2 prediction completed: {log_path}")
                         break
 
                     error_msg = self._read_log_tail(log_path, max_chars=4000)
                     is_badzip = "BadZipFile" in error_msg
+                    is_missing_pre_affinity = (
+                        "FileNotFoundError" in error_msg
+                        and "pre_affinity_" in error_msg
+                        and ".npz" in error_msg
+                    )
+                    is_cuda_oom = (
+                        "CUDA out of memory" in error_msg
+                        or "torch.OutOfMemoryError" in error_msg
+                    )
+
                     if is_badzip and attempt < max_attempts and cache_dir is not None:
                         # Corrupted npz in cache can happen when multiple boltz subprocesses write/read shared files.
                         # Reset this worker-local cache and retry once.
-                        print(f"Boltz cache corruption detected in {cache_dir}. Rebuilding cache and retrying once.")
+                        self._boltz_log(f"Boltz cache corruption detected in {cache_dir}. Rebuilding cache and retrying once.")
                         shutil.rmtree(cache_dir, ignore_errors=True)
                         cache_dir.mkdir(parents=True, exist_ok=True)
                         continue
-                    print(f"Boltz-2 prediction failed (see {log_path}):\n{error_msg}")
+
+                    if (is_missing_pre_affinity or is_cuda_oom) and attempt < max_attempts:
+                        # Boltz can intermittently fail with missing intermediate npz files or transient OOM.
+                        # Clean the output folder and retry from a fresh state.
+                        retry_reason = "missing pre_affinity npz" if is_missing_pre_affinity else "CUDA OOM"
+                        self._boltz_log(
+                            f"Boltz transient failure ({retry_reason}) detected; "
+                            f"retrying ({attempt + 1}/{max_attempts}) after cleanup."
+                        )
+                        shutil.rmtree(output_dir, ignore_errors=True)
+                        output_dir.mkdir(parents=True, exist_ok=True)
+                        time.sleep(2.0 if is_missing_pre_affinity else 5.0)
+                        continue
+                    self._boltz_log(f"Boltz-2 prediction failed (see {log_path}):\n{error_msg}")
                     raise subprocess.CalledProcessError(return_code, cmd)
                 except Exception:
                     # If interrupted/failed mid-run, terminate the entire process group to prevent orphan workers.
@@ -519,6 +626,42 @@ class UniDockBoltzTask(BaseDockingTask):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
 
+    def _register_active_boltz_proc(self, proc: subprocess.Popen) -> None:
+        """Track active Boltz subprocesses so interrupts can terminate all of them."""
+        with self._active_boltz_procs_lock:
+            self._active_boltz_procs[proc.pid] = proc
+
+    def _unregister_active_boltz_proc(self, proc: subprocess.Popen) -> None:
+        with self._active_boltz_procs_lock:
+            self._active_boltz_procs.pop(proc.pid, None)
+
+    def _terminate_active_boltz_processes(self) -> None:
+        """Best-effort shutdown for all active Boltz process groups."""
+        with self._active_boltz_procs_lock:
+            procs = list(self._active_boltz_procs.values())
+            self._active_boltz_procs.clear()
+
+        for proc in procs:
+            if proc.poll() is not None:
+                continue
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except Exception as e:
+                self._boltz_log(f"Warning: failed to terminate Boltz process group {proc.pid}: {e}")
+
+        for proc in procs:
+            if proc.poll() is not None:
+                continue
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+
     @staticmethod
     def _read_log_tail(log_path: Path, max_chars: int = 4000) -> str:
         """Read tail of log file for concise error reporting/retry checks."""
@@ -529,6 +672,52 @@ class UniDockBoltzTask(BaseDockingTask):
             return text[-max_chars:]
         except Exception:
             return ""
+
+    def _count_running_boltz_procs(self) -> int:
+        with self._active_boltz_procs_lock:
+            return sum(1 for proc in self._active_boltz_procs.values() if proc.poll() is None)
+
+    def _get_gpu_free_memory_mb(self) -> float | None:
+        if not torch.cuda.is_available():
+            return None
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+            return free_bytes / (1024 * 1024)
+        except Exception:
+            return None
+
+    def _wait_for_gpu_slot(self) -> None:
+        """Wait for a launch slot and enough free GPU memory before starting a new Boltz process."""
+        if not torch.cuda.is_available():
+            return
+
+        start_time = time.time()
+        wait_round = 0
+        while True:
+            wait_round += 1
+            running_boltz = self._count_running_boltz_procs()
+            free_mb = self._get_gpu_free_memory_mb()
+            enough_memory = free_mb is None or free_mb >= self._boltz_min_free_gpu_mb
+            has_slot = running_boltz < self.boltz_worker
+
+            if has_slot and enough_memory:
+                return
+
+            if wait_round == 1 or wait_round % 5 == 0:
+                free_repr = f"{free_mb:.1f} MiB" if free_mb is not None else "unknown"
+                waited_s = time.time() - start_time
+                self._boltz_log(
+                    "Waiting for GPU before Boltz launch: "
+                    f"running_boltz={running_boltz}, free={free_repr}, "
+                    f"required>={self._boltz_min_free_gpu_mb} MiB, "
+                    f"max_workers={self.boltz_worker}, waited={waited_s:.1f}s"
+                )
+
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            time.sleep(self._boltz_gpu_wait_interval_s)
 
     def _get_worker_cache_dir(self) -> Path | None:
         """Return a cache directory isolated per thread when using multiple boltz workers."""
@@ -592,8 +781,8 @@ class UniDockBoltzTask(BaseDockingTask):
                 break
         
         if affinity_file is None:
-            print(f"No affinity JSON file found for query '{query_name}' in {boltz_output_dir}")
-            print(f"Searched paths: {[str(p) for p in possible_paths[:5]]}")
+            self._boltz_log(f"No affinity JSON file found for query '{query_name}' in {boltz_output_dir}")
+            self._boltz_log(f"Searched paths: {[str(p) for p in possible_paths[:5]]}")
             return None
         
         try:
@@ -611,11 +800,11 @@ class UniDockBoltzTask(BaseDockingTask):
             }
             return result
         except Exception as e:
-            print(f"Error extracting Boltz results from {affinity_file}: {e}")
+            self._boltz_log(f"Error extracting Boltz results from {affinity_file}: {e}")
             return None
 
 
-class UniDockBoltzMOOTask(UniDockBoltzTask):
+class BoltzMOOTask(BoltzTask):
     avg_reward_info: OrderedDict[str, float]
 
     def __init__(self, cfg: Config):
@@ -714,7 +903,7 @@ class UniDockBoltzMOOTask(UniDockBoltzTask):
         self.topn_affinity = OrderedDict(topn)
 
 
-class UniDockBoltzMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzMOOTask]):
+class BoltzMOOTrainer(RxnFlow3DTrainer_single[BoltzMOOTask]):
     def setup(self):
         """Override setup to skip directory deletion when resuming."""
         if _RESUME_MODE:
@@ -759,7 +948,7 @@ class UniDockBoltzMOOTrainer(RxnFlow3DTrainer_single[UniDockBoltzMOOTask]):
             super().setup()
     
     def setup_task(self):
-        self.task = UniDockBoltzMOOTask(cfg=self.cfg)
+        self.task = BoltzMOOTask(cfg=self.cfg)
 
     def build_training_data_loader(self):
         """Override to add BoltzinaSQLiteLogHook for separate database."""
